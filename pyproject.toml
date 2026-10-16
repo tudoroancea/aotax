@@ -1,0 +1,41 @@
+[project]
+name = "aotax"
+version = "0.1.0a1"
+description = "Compile a JAX function ahead of time, through IREE, into a static C library and header."
+readme = "README.md"
+authors = [{ name = "Tudor Oancea", email = "oancea.tudor@icloud.com" }]
+requires-python = ">=3.12"
+license = "BSD-2-Clause"
+license-files = ["LICENSE.md"]
+dependencies = [
+  "jax>=0.11",
+  # The C host is written against this release's runtime API, and the runtime is built at it.
+  "iree-base-compiler==3.12.0",
+  "numpy>=2",
+  "cmake",
+  "ninja",
+]
+
+[project.urls]
+Repository = "https://github.com/tudoroancea/aotax"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = ["pytest", "ruff", "ty"]
+bench = ["scaly", "asdex==0.5.2"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.sources]
+scaly = { git = "https://github.com/PREDICT-EPFL/scaly", branch = "main" }
+
+[tool.ruff]
+indent-width = 2
+line-length = 150
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
