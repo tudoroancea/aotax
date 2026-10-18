@@ -563,7 +563,9 @@ class _Host:
           spec.validate_hal([v.type for v in o.operands], [v.type for v in o.results])
           for result, tensor in zip(o.results, spec.results, strict=True):
             allocate(o, result, tensor.size)
-          pointers = [*a, *(names[r] for r in o.results), scratch]
+          if self.device == "metal":
+            emit(self.wait())
+          pointers = [*(self.read(p) for p in (*a, *(names[r] for r in o.results))), scratch]
           emit(f"if ({symbol}({', '.join(pointers)})) return fail({json.dumps(f'custom call {spec.target} failed')});")
         elif n == "util.return":
           if main:
@@ -647,7 +649,8 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas or any(s.foreign is None for s in custom_calls.values()) else ""}
+#include <math.h>
+{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas or any(s.target.startswith("lapack_") and s.foreign is None for s in custom_calls.values()) else ""}
 #include "{n}.h"
 
 {chr(10).join(f"extern const library_header** {q}(uint32_t, const environment*);" for q in queries)}
@@ -661,26 +664,7 @@ struct {n}_context {{
   {chr(10).join(h.fields)}
 }};
 
-#if defined(__aarch64__)
-#define FPU_MASK UINT64_C(0x1080000)
-static uint64_t fpu_get(void) {{ uint64_t state; __asm__ volatile("mrs %0, fpcr" : "=r"(state)); return state; }}
-static void fpu_set(uint64_t state) {{ __asm__ volatile("msr fpcr, %0" : : "r"(state)); }}
-#elif defined(__x86_64__) || defined(__i386__)
-#include <xmmintrin.h>
-#define FPU_MASK UINT64_C(0x8040)
-static uint64_t fpu_get(void) {{ return _mm_getcsr(); }}
-static void fpu_set(uint64_t state) {{ _mm_setcsr((uint32_t)state); }}
-#else
-#define FPU_MASK UINT64_C(0)
-static uint64_t fpu_get(void) {{ return 0; }}
-static void fpu_set(uint64_t state) {{ (void)state; }}
-#endif
-static uint64_t fpu_enter(void) {{
-  uint64_t state = fpu_get();
-  if ((state & FPU_MASK) != FPU_MASK) fpu_set(state | FPU_MASK);
-  return state;
-}}
-static void fpu_leave(uint64_t state) {{ if ((state & FPU_MASK) != FPU_MASK) fpu_set(state); }}
+{fpu(lib.approximate_math)}
 
 static int fail(const char* message) {{ fprintf(stderr, "{n}: %s\\n", message); return 1; }}
 static int find_entry(const executable* e, const char* name) {{
@@ -746,3 +730,27 @@ incompatible:
 }}
 void {n}_destroy({n}_context* c) {{ if (c) {{ free(c->local_memory); free(c); }} }}
 '''
+
+
+def fpu(approximate):
+  return f"""#if defined(__aarch64__)
+#define FPU_MASK UINT64_C(0x1080000)
+static uint64_t fpu_get(void) {{ uint64_t state; __asm__ volatile("mrs %0, fpcr" : "=r"(state)); return state; }}
+static void fpu_set(uint64_t state) {{ __asm__ volatile("msr fpcr, %0" : : "r"(state)); }}
+#elif defined(__x86_64__) || defined(__i386__)
+#include <xmmintrin.h>
+#define FPU_MASK UINT64_C(0x8040)
+static uint64_t fpu_get(void) {{ return _mm_getcsr(); }}
+static void fpu_set(uint64_t state) {{ _mm_setcsr((uint32_t)state); }}
+#else
+#define FPU_MASK UINT64_C(0)
+static uint64_t fpu_get(void) {{ return 0; }}
+static void fpu_set(uint64_t state) {{ (void)state; }}
+#endif
+static uint64_t fpu_enter(void) {{
+  uint64_t state = fpu_get();
+  uint64_t mode = {"state | FPU_MASK" if approximate else "state & ~FPU_MASK"};
+  if (state != mode) fpu_set(mode);
+  return state;
+}}
+static void fpu_leave(uint64_t state) {{ fpu_set(state); }}"""

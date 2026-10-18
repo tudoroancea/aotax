@@ -1,12 +1,124 @@
-"""Prepare f64 math for dispatch vectorization."""
+"""Accurate elementary functions and optional dispatch approximations."""
 
+import math
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 from iree.compiler import ir as mlir
+from jax.extend import core
+from jax.interpreters import mlir as jax_mlir
+
+from aotax.custom_calls import Call, Tensor, replace_call
 
 ir: Any = mlir
+
+FUNCTIONS = {
+  "sine": "sin",
+  "cosine": "cos",
+  "exponential": "exp",
+  "log": "log",
+  "tanh": "tanh",
+  "exponential_minus_one": "expm1",
+  "log_plus_one": "log1p",
+  "atan2": "atan2",
+  "power": "pow",
+  "cbrt": "cbrt",
+  "tan": "tan",
+}
+COMPOSITES = {f"chlo.{name}": name for name in ("asin", "acos", "atan", "asinh", "acosh", "atanh", "sinh", "cosh", "tan", "erf", "erfc")}
+DISPATCH_MATH = {"sin", "cos", "exp", "log", "tanh"}
+PRESERVED = {name: core.Primitive(f"aotax_{name}") for name in ("erfc", "exp2", "log2", "log10")}
+
+
+for _name, _primitive in PRESERVED.items():
+  _primitive.def_abstract_eval(lambda x, **params: x)
+  jax_mlir.register_lowering(_primitive, lambda ctx, x, function=_name, **params: jax.ffi.ffi_lowering(f"aotax.math.{function}")(ctx, x))
+
+
+def preserve_math(fn, args):
+  closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
+  tree = jax.tree.structure(shapes)
+
+  def rewrite(value):
+    if isinstance(value, core.Jaxpr):
+      return value.replace(eqns=[e.replace(primitive=PRESERVED.get(e.primitive.name, e.primitive), params=rewrite(e.params)) for e in value.eqns])
+    if isinstance(value, dict):
+      return {key: rewrite(v) for key, v in value.items()}
+    if type(value) in (tuple, list):
+      return type(value)(map(rewrite, value))
+    return value
+
+  evaluate = core.jaxpr_as_fun(rewrite(closed))
+  return lambda *a: jax.tree.unflatten(tree, evaluate(*jax.tree.leaves(a)))
+
+
+class MathCall(Call):
+  @property
+  def scratch(self):
+    return 0
+
+  def adapter(self, symbol):
+    t, suffix = ("double", "") if self.inputs[0].dtype == "f64" else ("float", "f")
+    args = [*(f"const void* p{i}" for i in range(len(self.inputs))), "void* r0", "void* scratch"]
+    values = ", ".join(f"((const {t}*)p{i})[i]" for i in range(len(self.inputs)))
+    return f"""static int {symbol}({", ".join(args)}) {{
+  for (size_t i = 0; i < {math.prod(self.results[0].shape)}; ++i) (({t}*)r0)[i] = {self.target}{suffix}({values});
+  return 0;
+}}
+"""
+
+
+def accurate_math(text: str, device: str, approximate: bool = False) -> tuple[str, dict[str, Call]]:
+  with ir.Context() as ctx:
+    ctx.allow_unregistered_dialects = True
+    module = ir.Module.parse(text)
+    ops = []
+
+    def collect(op):
+      function = FUNCTIONS.get(op.name.removeprefix("stablehlo."))
+      if op.name == "stablehlo.composite":
+        function = COMPOSITES.get(op.attributes["name"].value)
+      if op.name == "stablehlo.custom_call":
+        target = op.attributes["call_target_name"].value
+        if target in {f"aotax.math.{name}" for name in PRESERVED}:
+          function = target.removeprefix("aotax.math.")
+      if function and str(ir.RankedTensorType(op.results[0].type).element_type) in {"f32", "f64"}:
+        ops.append((op, function))
+      for region in op.regions:
+        for block in region.blocks:
+          for child in block.operations:
+            collect(child.operation)
+
+    collect(module.operation)
+    registry = {}
+    symbols = {o.attributes["sym_name"].value for o in module.body.operations if "sym_name" in o.attributes}
+    for op, function in ops:
+      t = ir.RankedTensorType(op.results[0].type)
+      if approximate and not (device == "cpu" and function == "cbrt" and str(t.element_type) == "f64"):
+        continue
+      if device == "cpu" and function in DISPATCH_MATH:
+        if str(t.element_type) == "f32":
+          wide = ir.RankedTensorType.get(t.shape, ir.F64Type.get(), loc=op.location)
+          convert = ir.Operation.create("stablehlo.convert", operands=list(op.operands), results=[wide], ip=ir.InsertionPoint(op), loc=op.location)
+          op.operands[0] = convert.results[0]
+          op.results[0].set_type(wide)
+          narrow = ir.Operation.create("stablehlo.convert", operands=[op.results[0]], results=[t], ip=ir.InsertionPoint.after(op), loc=op.location)
+          op.results[0].replace_all_uses_with(narrow.results[0])
+          narrow.operands[0] = op.results[0]
+        continue
+      index = len(registry)
+      while (symbol := f"aotax_math{index}") in symbols:
+        index += 1
+      symbols.add(symbol)
+
+      def tensor(v):
+        t = ir.RankedTensorType(v.type)
+        return Tensor(tuple(t.shape), str(t.element_type))
+
+      registry[symbol] = MathCall(function, tuple(map(tensor, op.operands)), tuple(map(tensor, op.results)), (), ())
+      replace_call(module, op, symbol)
+    return module.operation.get_asm(enable_debug_info=True), registry
 
 
 def _exp(x):
@@ -44,7 +156,7 @@ def _exp(x):
   return jax.lax.select(jax.lax.ne(x, x), x, result)
 
 
-def expand_math(text: str) -> str:
+def expand_math(text: str, approximate: bool = False) -> str:
   with ir.Context() as ctx:
     ctx.allow_unregistered_dialects = True
     module = ir.Module.parse(text)
@@ -57,6 +169,7 @@ def expand_math(text: str) -> str:
       has_dot |= op.name in {"stablehlo.dot", "stablehlo.dot_general"}
       if (
         op.name == "stablehlo.exponential"
+        and approximate
         and "result_accuracy" not in op.attributes
         and str(ir.RankedTensorType(op.results[0].type).element_type) == "f64"
       ):

@@ -84,9 +84,9 @@ keep IREE's dispatch code. Other platforms use IREE for all dispatches.
 On the CPU, `{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
 Constants are embedded as aligned static data; any constant preparation runs at creation. The host
 allocates no heap memory during calls; Accelerate may allocate internally.
-It flushes subnormal values to zero during execution, as IREE does,
-and restores the caller's floating-point mode afterward. Inputs bind directly to the caller's arrays
-when the HAL program never writes them. Outputs bind directly when the HAL program gives them
+It preserves subnormal values by default. With `approximate_math=True`, it flushes them to zero
+as IREE does. Both modes restore the caller's floating-point mode afterward. Inputs bind directly
+to the caller's arrays when the HAL program never writes them. Outputs bind directly when the HAL program gives them
 a separate buffer. Results that share storage with inputs, constants, or
 other results need a copy.
 
@@ -96,10 +96,30 @@ This meets the dispatch code's alignment assumptions and preserves the caller's 
 Inputs may overlap outputs, in which case the affected inputs are copied before execution. Outputs
 may overlap each other and are written in the order listed in the header.
 
-Before IREE sees the program, aotax replaces every `float64` `exp` with a range reduction and a
-polynomial built from ordinary arithmetic, so that it vectorizes with the rest of its dispatch
-instead of calling libm once per element. It stays within 2 units in the last place (ulp) of libm
-over the whole range, and handles infinities, NaN and underflow to zero.
+Elementary functions use libm-quality results by default. On the CPU, `sin`, `cos`, `exp`, `log`
+and `tanh` stay in dispatches; their `float32` inputs are promoted to `float64` and their results
+converted back. Other elementary functions use generated libm adapters because IREE expands
+some of them inaccurately even in `float64`, including `expm1` and `log1p` near zero.
+The default covers trig and inverse trig, hyperbolic and inverse hyperbolic functions, exponentials,
+logarithms, `power`, `cbrt`, `erf` and `erfc`. Dense sweeps, including large arguments and special
+values, stay within 2 units in the last place (ulp) of NumPy or the system libm on the tested machine.
+This is a check of individual functions, not an error bound for a whole compiled program.
+
+Use `aotax.compile(..., approximate_math=True)` to allow faster approximations. On the CPU this
+enables aotax's vectorized `float64` `exp` polynomial and IREE's built-in approximations. The
+`exp` polynomial stays within 2 ulp after flushing subnormal results to zero, and handles NaN
+and infinities. IREE's approximations have no common error bound. Its
+[math transform pass](https://github.com/iree-org/iree/blob/v3.12.0/compiler/src/iree/compiler/Codegen/Common/MathTransform.cpp)
+has no option to disable them in 3.12, which is why the accurate path uses promotion and adapters.
+CPU `float64` `cbrt` uses libm in both modes because IREE cannot lower it.
+
+On Metal, the default runs elementary functions through host libm adapters, waiting for preceding
+GPU work and writing results into shared buffers. This adds synchronization and can make math-heavy
+GPU programs much slower. Opting in keeps these operations on the GPU with IREE's approximations.
+Both modes use `MTLMathModeSafe`; the default also selects `MTLMathFloatingPointFunctionsPrecise`,
+and opt-in selects `Fast`. These are separate options. Safe alone leaves native math functions at
+Fast and cannot repair polynomials already emitted by IREE. See Apple's
+[compile-option semantics](https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode).
 
 In programs without StableHLO dot operations, aotax also puts compiler barriers after `float64` `sin`,
 `cos` and `tanh` results that feed broadcasts. IREE then computes these libm results before
@@ -152,7 +172,8 @@ lists every specialization's inputs, results and scratch size.
 Calls are synchronous. Inputs are borrowed and immutable; fill every result in its fresh buffer
 and retain no pointers after returning. Return zero on success or nonzero for an execution error.
 Keep numerical status, such as solver convergence, in tensor results. Foreign code runs with the
-library's floating-point mode, which flushes subnormals to zero. For temporary storage,
+library's floating-point mode, which preserves subnormals unless `approximate_math=True`.
+For temporary storage,
 use `aotax.Foreign("my_twice", scratch=256)` in the registry. Scratch lives in the context,
 is aligned to 64 bytes and is reused without clearing. With no scratch request the pointer is null.
 
@@ -165,7 +186,7 @@ cc main.c -I build/twice build/twice/libtwice.a my_twice.o -lm -framework Accele
 
 Omit `-framework Accelerate` outside macOS. `load(extra=[...])` accepts the same objects, libraries
 and link flags after the archive. An XLA-registered handler has a different call-frame ABI;
-aotax never calls it. Only explicit registry entries receive JAX export exemptions, and no XLA
+aotax never calls it. Only explicitly registered user targets receive JAX export exemptions, and no XLA
 registration is needed to compile them. CPU tensor calls work inside JAX loops. Backend attributes,
 opaque state, effects, tokens, non-row-major layouts and input/output alias requests raise compilation
 errors. Pass attribute values as tensor operands instead.
@@ -177,13 +198,19 @@ statistics in a vector avoids this compiler failure.
 
 - CPU code is compiled for the host CPU; there is no cross-compilation.
 - Shapes are static, and inputs and outputs are dense `float32`, `float64`, `int32` or `int64`.
-- IREE 3.12's float32 `sin`/`cos` on CPU and Metal lose range-reduction accuracy around `|x| = 1e3` (absolute error about `3e-5`, growing with magnitude).
+- With `approximate_math=True`, IREE 3.12's float32 `sin`/`cos` on CPU and Metal lose range-reduction
+  accuracy around `|x| = 1e3`, with absolute error about `3e-5`, and can return enormous values at
+  `1e10`. Subnormals are flushed, small `float64` `expm1`/`log1p` lose accuracy, and powers with
+  negative bases or nonfinite operands can differ from libm. Validate the opt-in mode on your inputs.
+- The flag controls elementary functions and `erf`/`erfc`. Other JAX special-function algorithms
+  and polynomials written directly by the caller retain their own accuracy limits.
 - Host dispatches run on one thread; Accelerate controls threading within BLAS calls. A context
   cannot be called concurrently; separate contexts can.
 - Metal requires a Metal 4 device and macOS 26 or later, and a macOS 26 or later SDK to build the
   host. Inputs and outputs must be `float32` or `int32`. Float64 intermediates raise an error;
   IREE's internal integer indices keep their original width. Metal does not use Accelerate or
-  support custom calls. Host control flow is preserved, but each loop iteration that submits work
+  support user or LAPACK custom calls. Its generated elementary-function adapters run on the host.
+  Host control flow is preserved, but each loop iteration that submits work
   pays GPU submission and completion latency. Single small evaluations are much slower than the
   CPU; batching can amortize that cost. A reported GPU error permanently fails the context;
   destroy it and create a new one. See [Metal measurements](notes/metal.md).
@@ -210,7 +237,8 @@ suite: the sparse Lagrangian Hessian (lower triangle) or constraint Jacobian of 
 predictive control problems. Scaly compiles them with its own symbolic compiler; aotax compiles the
 same functions written in JAX and differentiated sparsely by [asdex](https://adrianhill.de/asdex/).
 Every entry is checked against a dense JAX derivative before timing. aotax CPU time divided by
-Scaly's on an Apple M4 Max, best of three processes:
+Scaly's on an Apple M4 Max, best of three processes. These historical measurements used the
+math approximations now enabled by `approximate_math=True`; the benchmark harness uses the accurate default:
 
 | Problem | Sizes | Hessian | Jacobian |
 |---|---|---|---|
@@ -226,11 +254,36 @@ matrix products. There most of the gap is the derivative algorithm rather than t
 asdex's colored products do 4.5 to 11.5 times the arithmetic of Scaly's symbolic derivatives, and
 XLA running the same asdex functions is also 5 to 9 times slower than Scaly.
 
+With the new default, an interleaved comparison on the same machine, best of five fresh processes
+per mode with alternating order, gives the following CPU times. Every binary checks every sparse
+entry against its dense reference before timing. The opt-in gain is modest on npmpc and within
+noise on race cars. The standard benchmark harness keeps using the accurate default.
+
+| Workload | Horizon | Default µs | Opt-in µs | Opt-in speedup |
+|---|---:|---:|---:|---:|
+| npmpc | 12 | 16.72 | 16.32 | 1.024× |
+| npmpc | 50 | 61.32 | 58.10 | 1.056× |
+| npmpc | 200 | 209.23 | 200.88 | 1.042× |
+| npmpc_jac | 12 | 9.25 | 8.84 | 1.046× |
+| npmpc_jac | 50 | 34.52 | 32.58 | 1.059× |
+| npmpc_jac | 200 | 133.65 | 125.75 | 1.063× |
+| race_cars | 5 | 3.55 | 3.56 | 0.998× |
+| race_cars | 40 | 18.06 | 17.84 | 1.013× |
+| race_cars | 500 | 261.27 | 258.01 | 1.013× |
+| race_cars_jac | 5 | 2.33 | 2.35 | 0.995× |
+| race_cars_jac | 40 | 15.00 | 15.12 | 0.992× |
+| race_cars_jac | 500 | 208.75 | 208.33 | 1.002× |
+
+The accurate f32 path also has a measurable cost. For `sin(x)*x + 2` on 65,536 float32 elements
+in [-1, 1], `Library.load()` takes 103.6 µs by default and 28.7 µs with opt-in, a 3.62× speedup.
+These are the best of five fresh processes per mode, alternating order, with 500 warm calls per
+process; allocation and Python call overhead are included. Both modes pass the dense check.
+
 The complete programs run whole algorithms written in JAX with loops: a fourth-order Runge-Kutta
 rollout, a Newton solve with `while_loop` and LU factorizations, a Gauss-Newton fit with Cholesky
 solves, a 15-step interior-point method for a quadratic program, and a batched Newton solve. aotax
 is compared with XLA running the same function inside one jitted loop, which excludes Python's
-call overhead. aotax time divided by XLA's:
+call overhead. These historical measurements also used approximations. aotax time divided by XLA's:
 
 | Program | Sizes | aotax / XLA |
 |---|---|---|
@@ -244,12 +297,12 @@ Newton loses at larger n because hundreds of small dispatches surround each fact
 `benchmarks/scaly_devrush.py` compares Newton and the quadratic program with the solvers Scaly
 generates on its development branch.
 
-On the GPU, `device="metal"` pays off only for batches: from about 32 to 48 npmpc Hessians at
-horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and 6.3× at 128. A single call
+With `approximate_math=True` on the GPU, `device="metal"` pays off only for batches: from about
+32 to 48 npmpc Hessians at horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and 6.3× at 128. A single call
 costs about 400 µs against 11 µs on the CPU. `notes/metal.md` has the measurements.
 
 The first version of aotax ran IREE's own runtime and took 30.7, 92.2 and 322.9 µs on the npmpc
-Hessian, now 15.9, 58.3 and 200.9 µs.
+Hessian, reduced to 15.9, 58.3 and 200.9 µs with the approximations now made opt-in.
 
 ## License
 

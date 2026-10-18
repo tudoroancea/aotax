@@ -247,19 +247,23 @@ def rewrite_custom_calls(text: str, foreign: dict[str, Foreign] | None = None) -
       while (symbol := f"aotax_cc{index}") in symbols:
         index += 1
       symbols.add(symbol)
-      ins, outs = [str(v.type) for v in op.operands], [str(v.type) for v in op.results]
-      declaration = ir.Module.parse(f"module {{ func.func private @{symbol}({', '.join(ins)}) -> ({', '.join(outs)}) }}")
-      declaration.body.operations[0].operation.clone(ir.InsertionPoint(module.body))
-      call = ir.Operation.create(
-        "func.call",
-        results=[v.type for v in op.results],
-        operands=list(op.operands),
-        attributes={"callee": ir.FlatSymbolRefAttr.get(symbol)},
-        ip=ir.InsertionPoint(op),
-        loc=op.location,
-      )
-      for old, new in zip(op.results, call.results, strict=True):
-        old.replace_all_uses_with(new)
+      replace_call(module, op, symbol)
       registry[symbol] = spec
-      op.erase()
     return module.operation.get_asm(enable_debug_info=True), registry
+
+
+def replace_call(module, op, symbol):
+  ins, outs = [str(v.type) for v in op.operands], [str(v.type) for v in op.results]
+  declaration = ir.Module.parse(f"module {{ func.func private @{symbol}({', '.join(ins)}) -> ({', '.join(outs)}) }}")
+  declaration.body.operations[0].operation.clone(ir.InsertionPoint(module.body))
+  call = ir.Operation.create(
+    "func.call",
+    results=[v.type for v in op.results],
+    operands=list(op.operands),
+    attributes={"callee": ir.FlatSymbolRefAttr.get(symbol)},
+    ip=ir.InsertionPoint(op),
+    loc=op.location,
+  )
+  for old, new in zip(op.results, call.results, strict=True):
+    old.replace_all_uses_with(new)
+  op.erase()

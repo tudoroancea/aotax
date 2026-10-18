@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_math import FUNCTIONS, functions, inputs, max_ulp
 
 import aotax
 from aotax.metal import validate
@@ -198,3 +199,28 @@ def test_rejects_custom_calls_and_unknown_device(tmp_path):
     validate(text)
   with pytest.raises(ValueError, match="unsupported device"):
     aotax.compile(lambda x: x, np.ones(3), out=tmp_path, device="gpu")
+
+
+@pytest.mark.parametrize("name", FUNCTIONS)
+def test_accurate_elementary_math(tmp_path, metal, name):
+  args = inputs(name, np.float32)
+  fn, reference = functions(name)
+  loaded = aotax.compile(fn, *args, out=tmp_path, name="compute", device="metal").load()
+  with np.errstate(all="ignore"):
+    got, want = loaded(*args), reference(*args)
+  np.testing.assert_array_equal(np.isnan(got), np.isnan(want))
+  np.testing.assert_array_equal(np.isinf(got), np.isinf(want))
+  np.testing.assert_array_equal(np.signbit(got[~np.isnan(want)]), np.signbit(want[~np.isnan(want)]))
+  assert max_ulp(got, want) <= 4
+
+
+@pytest.mark.parametrize("approximate", [False, True])
+def test_math_between_dispatches(tmp_path, metal, approximate):
+  def fn(x, n):
+    return jax.lax.fori_loop(0, n, lambda i, v: jnp.sin(v * 1.25) + jnp.exp(v * 0.1), x)
+
+  x = np.linspace(-1, 1, 65, dtype=np.float32)
+  loaded = aotax.compile(fn, x, np.int32(3), out=tmp_path, name="compute", device="metal", approximate_math=approximate).load()
+  for n in (0, 1, 3):
+    np.testing.assert_allclose(loaded(x, np.int32(n)), fn(x, np.int32(n)), rtol=3e-6, atol=3e-6)
+  assert "MTLMathModeSafe" in (tmp_path / "iree/host.m").read_text()

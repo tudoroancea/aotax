@@ -11,8 +11,8 @@
 - `src/aotax/cpu.py`: CPU compilation splits at executable configurations; this fills vector tile
   dimensions of extent 2, 4 or 8 in projected-permutation `linalg.generic`s, within 32 elements.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
-- `src/aotax/math.py`: expands f64 `exp` and separates broadcasted libm results from their consumers
-  in programs without dot operations.
+- `src/aotax/math.py`: preserves accurate elementary functions through JAX/IREE lowering, optionally
+  expands f64 `exp`, and separates broadcasted libm results in programs without dot operations.
 - `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
 - `benchmarks/`: Scaly's sparse derivative workloads, timed against Scaly's generated C, and complete
   JAX programs, timed against XLA; workloads live in `benchmarks/workloads/` (`benchmarks/README.md`).
@@ -33,12 +33,19 @@ uv run --group bench benchmarks/bench.py --reps 5
   block, so its commands run at the execute point. Other patterns are rejected at compile time.
 - Allocation sizes must be compile-time constants; transients live in the context. Loop-carried
   allocations get a pool of (live buffers + 1) slots.
-- Flush-to-zero is set once per call, as IREE's runtime did per dispatch, and the caller's mode is
-  restored. The polynomial `exp` explicitly selects zero below the smallest normal to match IREE.
+- The default clears flush-to-zero during execution; `approximate_math=True` enables it, as IREE's
+  runtime did per dispatch. Both restore the caller's mode. Only opt-in expands f64 `exp`; its
+  polynomial explicitly selects zero below the smallest normal.
 - Input pointers bind directly when 64-byte aligned, not overlapping outputs, and never written
   by the HAL program; otherwise they are staged through context buffers. Overlapping outputs are staged too.
 - IREE 3.12's `slow_memcpy` dispatch mishandles overlapping self-slices in `dynamic_update_slice`.
-- IREE 3.12's f32 `sin`/`cos` on CPU and Metal lose range-reduction accuracy around `|x| = 1e3` (absolute error ~3e-5, growing with magnitude).
+- Accurate CPU math keeps f64 `sin`, `cos`, `exp`, `log`, `tanh` in dispatches and promotes their
+  f32 equivalents. Other elementary functions use libm adapters, including `expm1`/`log1p` because
+  IREE rewrites even f64 to cancellation-prone expressions. Preserve JAX's `erfc`, `exp2`, `log2`
+  and `log10` primitives before export; their StableHLO decompositions already lose accuracy.
+- IREE 3.12's math transform pass has no disable option. Opt-in retains its f32 approximations;
+  `sin`/`cos` have ~3e-5 absolute error near |x|=1e3 and fail badly at 1e10. CPU f64 `cbrt` needs
+  libm in both modes because IREE cannot lower it.
 - Custom calls keep tensor results until HAL; exporting empty destination buffers can reorder reads before calls.
   Registered adapters borrow inputs, return fresh context buffers, and keep LAPACK `info` as tensor data.
 - Loop result slots avoid live pointers and call operands, including operands that die at the call.
@@ -51,8 +58,11 @@ uv run --group bench benchmarks/bench.py --reps 5
   native copies/fills. Overlapping native copies use scratch; non-byte fills expand a seed with copies.
 - Metal stages all caller arrays through context-owned shared buffers. Fences and host reads wait on
   a shared event and check commit feedback. Pipelines, argument tables and residency live in the context.
-  It requires macOS 26 and a Metal 4 device. It rejects float64 and custom calls, preserves internal
-  integer widths, and skips CPU BLAS routing and the f64 exp rewrite.
+  It requires macOS 26 and a Metal 4 device. It rejects float64 and user/LAPACK custom calls,
+  preserves internal integer widths, and skips CPU BLAS routing and the f64 exp rewrite.
+- Metal's accurate elementary functions run through synchronized host libm adapters on shared
+  buffers. Opt-in keeps IREE's GPU math. Both use `MTLMathModeSafe`; native functions use Precise
+  by default and Fast with opt-in. Safe and the native function set are independent options.
 
 ## Measuring
 

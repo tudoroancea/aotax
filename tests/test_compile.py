@@ -188,7 +188,8 @@ def test_subnormal_inputs(tmp_path):
 
   x = np.array([1e-310, -1e-310, 1e-300])
   before = np.multiply(x, 1e300)
-  check(amplify, x, tmp_path=tmp_path)
+  loaded = aotax.compile(amplify, x, out=tmp_path).load()
+  np.testing.assert_allclose(loaded(x), before, rtol=1e-15)
   np.testing.assert_array_equal(np.multiply(x, 1e300), before)
 
 
@@ -308,7 +309,8 @@ def test_blas_constant_and_subnormals(tmp_path):
 
   x = np.full((33, 29), 1e-310)
   before = x * 1e300
-  check(matmul, x, tmp_path=tmp_path)
+  loaded = aotax.compile(matmul, x, out=tmp_path).load()
+  np.testing.assert_allclose(loaded(x), x @ weights, rtol=1e-14)
   np.testing.assert_array_equal(x * 1e300, before)
   assert ("cblas_dgemm(" in (tmp_path / "iree" / "host.c").read_text()) == (sys.platform == "darwin")
 
@@ -323,7 +325,7 @@ def test_small_contraction_fallback(tmp_path):
 
 def test_exp_range_and_special_values(tmp_path):
   x = np.concatenate([np.linspace(-745, 710, 10001), np.linspace(-1e-14, 1e-14, 101), [0.0, -0.0, np.inf, -np.inf, np.nan]])
-  loaded = aotax.compile(jnp.exp, x, out=tmp_path, name="exp_range").load()
+  loaded = aotax.compile(jnp.exp, x, out=tmp_path, name="exp_range", approximate_math=True).load()
   assert "stablehlo.exponential" not in (tmp_path / "iree/stablehlo.mlir").read_text()
   with np.errstate(over="ignore", under="ignore"):
     expected = np.exp(x)

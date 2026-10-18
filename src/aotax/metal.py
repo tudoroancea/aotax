@@ -3,7 +3,7 @@
 import json
 import struct
 
-from aotax.host import BUFFERS, _data, _Host, _type, ir
+from aotax.host import BUFFERS, _data, _Host, _type, fpu, ir
 
 
 def validate(text):
@@ -198,6 +198,7 @@ class MetalHost(_Host):
           "MTLCompileOptions* options = [MTLCompileOptions new];",
           f"options.languageVersion = (MTLLanguageVersion){p['version']};",
           "options.mathMode = MTLMathModeSafe;",
+          f"options.mathFloatingPointFunctions = MTLMathFloatingPointFunctions{'Fast' if self.lib.approximate_math else 'Precise'};",
           f"id<MTLLibrary> lib = [c->device newLibraryWithSource:@{json.dumps(p['source'])} options:options error:&error];",
           'if (!lib) return fail(error.localizedDescription.UTF8String ?: "compiling Metal source");',
           f"id<MTLFunction> fn = [lib newFunctionWithName:@{json.dumps(p['entry'])}];",
@@ -244,6 +245,7 @@ class MetalHost(_Host):
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "{n}.h"
 
 typedef struct {{ size_t buffer, offset; }} view;
@@ -277,6 +279,7 @@ struct {n}_context {{
   {chr(10).join(self.fields)}
 }};
 {chr(10).join(self.data)}
+{fpu(self.lib.approximate_math)}
 static int fail(const char* message) {{ fprintf(stderr, "{n}: %s\\n", message); return 1; }}
 static id keep({n}_context* c, id object) {{ if (object) [c->owned addObject:object]; return object; }}
 static view offset(view v, size_t offset) {{ v.offset += offset; return v; }}
@@ -355,6 +358,7 @@ static void dispatch({n}_context* c, site* s, size_t ordinal, MTLSize groups, co
   [c->encoder setArgumentTable:s->table];
   [c->encoder dispatchThreadgroups:groups threadsPerThreadgroup:c->threads[ordinal]];
 }}
+{chr(10).join(spec.adapter(symbol) for symbol, (spec, _) in self.custom_calls.items())}
 {chr(10).join(functions)}
 static int setup({n}_context* c) {{
   NSError* error = nil;
@@ -378,7 +382,10 @@ int {n}_create({n}_context** context) {{ @autoreleasepool {{
     if (!c) return fail("allocating context");
     NSMutableArray* owned = [NSMutableArray new];
     c->owner = (__bridge_retained void*)owned; c->owned = owned;
-    if (setup(c)) {{ {n}_destroy(c); return 1; }}
+    uint64_t fp = fpu_enter();
+    int status = setup(c);
+    fpu_leave(fp);
+    if (status) {{ {n}_destroy(c); return 1; }}
     *context = c; return 0;
   }}
   return fail("Metal backend requires macOS 26 or later");
@@ -390,7 +397,10 @@ int {n}_create({n}_context** context) {{ @autoreleasepool {{
   view inputs[{max(1, ins)}] = {{{", ".join(stages) or "{0}"}}};
   view outputs[{max(1, outs)}] = {{0}}, results[{max(1, outs)}] = {{0}};
   {chr(10).join(f"memcpy(contents(c, inputs[{i}]), in{i}, {sizes[i]});" for i in range(ins))}
-  if (run{main}(c, inputs, outputs, results) || await_device(c)) return 1;
+  uint64_t fp = fpu_enter();
+  int status = run{main}(c, inputs, outputs, results) || await_device(c);
+  fpu_leave(fp);
+  if (status) return 1;
   {chr(10).join(f"memcpy(out{i}, contents(c, results[{i}]), {sizes[ins + i]});" for i in range(outs))}
   return 0;
 }} }}

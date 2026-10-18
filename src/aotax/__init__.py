@@ -20,7 +20,7 @@ from aotax.blas import contractions
 from aotax.cpu import fill_small_tiles
 from aotax.custom_calls import FFI_HEADER, Foreign, rewrite_custom_calls
 from aotax.host import binding_writes, host
-from aotax.math import expand_math
+from aotax.math import PRESERVED, accurate_math, expand_math, preserve_math
 
 __all__ = ["Foreign", "Library", "compile"]
 
@@ -73,6 +73,7 @@ class Library:
   in_tree: Any
   out_tree: Any
   device: str = "cpu"
+  approximate_math: bool = False
 
   @property
   def system_libs(self) -> tuple[str, ...]:
@@ -90,11 +91,14 @@ def compile(
   name: str | None = None,
   foreign: Mapping[str, str | Foreign] | None = None,
   device: str = "cpu",
+  approximate_math: bool = False,
 ) -> Library:
   """Compile `fn` at the shapes and dtypes of `args`, arrays or `jax.ShapeDtypeStruct`s, into `out`.
 
   `out` receives `{name}.h` and `lib{name}.a`, and `iree/` beneath it the intermediate files: the
   StableHLO, IREE's hardware abstraction layer (HAL) program, dispatch object and generated host.
+  `approximate_math=True` permits IREE's math approximations and aotax's f64 exp polynomial.
+  The default uses libm-quality elementary functions; Metal runs these on the host.
   """
   if device not in {"cpu", "metal"}:
     raise ValueError(f"aotax: unsupported device {device!r}; use 'cpu' or 'metal'")
@@ -116,12 +120,17 @@ def compile(
   work = out / "iree"
   work.mkdir(parents=True, exist_ok=True)
 
+  if not approximate_math:
+    fn = preserve_math(fn, args)
+
   # jax.export names the module after the function, `jit_{name}`, and IREE every C symbol after the module.
   def wrapped(*a: Any) -> Any:
     return fn(*a)
 
   wrapped.__name__ = name
   checks = [jax.export.DisabledSafetyCheck.custom_call(target) for target in targets]
+  if not approximate_math:
+    checks.extend(jax.export.DisabledSafetyCheck.custom_call(f"aotax.math.{function}") for function in PRESERVED)
   exported = jax.export.export(jax.jit(wrapped), disabled_checks=checks)(*args)
   for aval in (*exported.in_avals, *exported.out_avals):
     if aval.dtype not in DTYPES:
@@ -132,10 +141,26 @@ def compile(
     from aotax.metal import validate
 
     text, custom_calls = exported.mlir_module(), {}
-    validate(text)
   else:
-    text, custom_calls = rewrite_custom_calls(expand_math(exported.mlir_module()), targets)
-  library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree, device)
+    text, custom_calls = expand_math(exported.mlir_module(), approximate_math), {}
+  text, math_calls = accurate_math(text, device, approximate_math)
+  custom_calls.update(math_calls)
+  if device == "metal":
+    validate(text)
+  if device == "cpu":
+    text, calls = rewrite_custom_calls(text, targets)
+    custom_calls.update(calls)
+  library = Library(
+    name,
+    out / f"{name}.h",
+    out / f"lib{name}.a",
+    exported.in_avals,
+    exported.out_avals,
+    exported.in_tree,
+    exported.out_tree,
+    device,
+    approximate_math,
+  )
 
   (work / "stablehlo.mlir").write_text(text)
   sources = work / "sources"
@@ -220,7 +245,7 @@ def compile(
       "-fPIC",
       "-std=c11",
       *(["-fobjc-arc", "-fblocks", "-mmacosx-version-min=13.0", "-Wno-unguarded-availability-new"] if device == "metal" else []),
-      "-I",
+      "-iquote",
       out,
       "-c",
       source,
