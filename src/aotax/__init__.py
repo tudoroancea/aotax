@@ -15,16 +15,18 @@ import numpy as np
 from iree.compiler.tools import binaries
 from jax.core import ShapedArray
 
-from aotax.runtime import LIBRARIES, runtime
+from aotax.blas import contractions
+from aotax.exp import expand_exp
+from aotax.host import host
 
 __all__ = ["Library", "compile"]
 
-# The dtypes a library can take and return: their C type and IREE's element type.
+# The dtypes a library can take and return, and their C types.
 DTYPES = {
-  np.dtype(np.float32): ("float", "IREE_HAL_ELEMENT_TYPE_FLOAT_32"),
-  np.dtype(np.float64): ("double", "IREE_HAL_ELEMENT_TYPE_FLOAT_64"),
-  np.dtype(np.int32): ("int32_t", "IREE_HAL_ELEMENT_TYPE_INT_32"),
-  np.dtype(np.int64): ("int64_t", "IREE_HAL_ELEMENT_TYPE_INT_64"),
+  np.dtype(np.float32): "float",
+  np.dtype(np.float64): "double",
+  np.dtype(np.int32): "int32_t",
+  np.dtype(np.int64): "int64_t",
 }
 
 IREE_FLAGS = (
@@ -35,16 +37,20 @@ IREE_FLAGS = (
   "--iree-hal-target-device=local",
   "--iree-hal-local-target-device-backends=llvm-cpu",
   "--iree-llvmcpu-target-cpu=host",
-  # The dispatches as a plain object whose sin, cos and exp resolve against libm, instead of IREE's
+  # The host runs on one thread, so distributing dispatches only adds overhead.
+  "--iree-llvmcpu-disable-distribution",
+  # Unroll short dispatch loops to reduce branch overhead.
+  "--iree-llvmcpu-loop-unrolling",
+  # The dispatches as a plain object whose transcendental calls resolve against libm, instead of IREE's
   # self-contained ELF, which has no f64 versions of them.
   "--iree-llvmcpu-link-embedded=false",
   "--iree-llvmcpu-link-static",
-  # The program that drives the dispatches as C rather than as bytecode for the runtime to interpret.
-  "--output-format=vm-c",
+  "--compile-to=hal",
+  "--iree-hal-memoization=false",
 )
 
 # What a program linking the archive needs besides it.
-SYSTEM_LIBS = ("-lm",) if sys.platform == "darwin" else ("-lm", "-lpthread", "-ldl")
+SYSTEM_LIBS = ("-lm", "-framework", "Accelerate") if sys.platform == "darwin" else ("-lm",)
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,7 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
   """Compile `fn` at the shapes and dtypes of `args`, arrays or `jax.ShapeDtypeStruct`s, into `out`.
 
   `out` receives `{name}.h` and `lib{name}.a`, and `iree/` beneath it the intermediate files: the
-  StableHLO, IREE's VM program as C, the dispatches' object and the host that runs them.
+  StableHLO, IREE's hardware abstraction layer (HAL) program, dispatch object and generated host.
   """
   name = name or getattr(fn, "__name__", "")
   if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
@@ -93,38 +99,39 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
       raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
   library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree)
 
-  (work / "stablehlo.mlir").write_text(exported.mlir_module())
+  (work / "stablehlo.mlir").write_text(expand_exp(exported.mlir_module()))
+  sources = work / "sources"
+  if sys.platform == "darwin":
+    sources.mkdir(exist_ok=True)
+    for path in sources.glob("*.mlir"):
+      path.unlink()
+  for path in (work / "library.o", work / "library.h"):
+    path.unlink(missing_ok=True)
   subprocess.run(
     [
       binaries.find_tool("iree-compile"),
       work / "stablehlo.mlir",
       *IREE_FLAGS,
+      *([f"--iree-hal-dump-executable-sources-to={sources}"] if sys.platform == "darwin" else []),
       f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}",
       "-o",
-      work / "module.h",
+      work / "hal.mlir",
     ],
     check=True,
   )
   library.header.write_text(_header(library))
-  # `{module}_linked`, or the executable's own name when the module has only one.
-  query = re.search(r"(\w+_library_query)\(", (work / "library.h").read_text())
-  assert query, "library.h declares no library query"
-  (work / "host.c").write_text(_host(library, query[1]))
-  prefix = runtime()
+  queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
+  blas = contractions(sources) if sys.platform == "darwin" else {}
+  (work / "host.c").write_text(host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas))
   cc = os.environ.get("CC", "cc")
   subprocess.run(
     [
       cc,
       "-O2",
       "-fPIC",
-      "-isystem",
-      prefix / "include",
-      "-I",
-      work,
+      "-std=c11",
       "-I",
       out,
-      # The allocator IREE's CMake package would define for its users.
-      "-DIREE_ALLOCATOR_SYSTEM_CTL=iree_allocator_libc_ctl",
       "-c",
       work / "host.c",
       "-o",
@@ -132,28 +139,28 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
     ],
     check=True,
   )
-  _merge(library.archive, [work / "host.o", work / "library.o"], [prefix / "lib" / f"lib{lib}.a" for lib in LIBRARIES])
+  _merge(library.archive, [work / "host.o", *([work / "library.o"] if queries else [])])
   return library
 
 
-def _merge(archive: Path, objects: list[Path], archives: list[Path]) -> None:
-  """One archive holding the objects and every member of the archives, so a program links it alone, in any order."""
+def _merge(archive: Path, objects: list[Path]) -> None:
+  """One archive holding the generated host and dispatches."""
   archive.unlink(missing_ok=True)
   if sys.platform == "darwin":
-    subprocess.run(["libtool", "-static", "-no_warning_for_no_symbols", "-o", archive, *objects, *archives], check=True, capture_output=True)
+    subprocess.run(["libtool", "-static", "-no_warning_for_no_symbols", "-o", archive, *objects], check=True, capture_output=True)
     return
-  script = [f"CREATE {archive}", *(f"ADDMOD {o}" for o in objects), *(f"ADDLIB {a}" for a in archives), "SAVE", "END", ""]
+  script = [f"CREATE {archive}", *(f"ADDMOD {o}" for o in objects), "SAVE", "END", ""]
   subprocess.run(["ar", "-M"], input="\n".join(script), text=True, check=True)
 
 
 def _c_type(aval: ShapedArray) -> str:
-  return DTYPES[np.dtype(aval.dtype)][0]
+  return DTYPES[np.dtype(aval.dtype)]
 
 
 def _signature(lib: Library) -> str:
   inputs = [f"const {_c_type(a)}* in{i}" for i, a in enumerate(lib.in_avals)]
   outputs = [f"{_c_type(a)}* out{i}" for i, a in enumerate(lib.out_avals)]
-  return f"int {lib.name}_call({lib.name}_context* context, {', '.join(inputs + outputs)})"
+  return f"int {lib.name}_call({', '.join([f'{lib.name}_context* context', *inputs, *outputs])})"
 
 
 def _header(lib: Library) -> str:
@@ -163,7 +170,9 @@ def _header(lib: Library) -> str:
 // {lib.name}, compiled from a JAX function by aotax. Link lib{lib.name}.a, then {" ".join(SYSTEM_LIBS)}.
 // Arrays are contiguous and row-major:
 {chr(10).join(shapes)}
-// Each function returns 0 on success; on failure it prints IREE's error to stderr and returns 1.
+// create and call return 0 on success; on failure they print an error to stderr and return 1.
+// Pointers need no special alignment. Align to 64 bytes to avoid staging copies.
+// Inputs may alias outputs; outputs may overlap and are written in the order listed.
 // A context is not thread-safe, but separate contexts may be used concurrently.
 #pragma once
 
@@ -182,159 +191,6 @@ void {lib.name}_destroy({lib.name}_context* context);
 #ifdef __cplusplus
 }}
 #endif
-"""
-
-
-def _host(lib: Library, query: str) -> str:
-  n, module = lib.name, f"jit_{lib.name}"
-  shapes, inputs = [], []
-  for i, a in enumerate(lib.in_avals):
-    if a.shape:
-      shapes.append(f"static const iree_hal_dim_t in{i}_shape[] = {{{', '.join(map(str, a.shape))}}};")
-    shape = f"in{i}_shape" if a.shape else "NULL"
-    element = DTYPES[np.dtype(a.dtype)][1]
-    inputs.append(
-      f"  if (iree_status_is_ok(status)) status = allocate_input(c, {i}, {len(a.shape)}, {shape}, {element}, {a.size * a.dtype.itemsize});"
-    )
-  writes = [
-    f"    status = iree_hal_buffer_map_write(iree_hal_buffer_view_buffer(c->inputs[{i}]), 0, in{i}, {a.size * a.dtype.itemsize});"
-    for i, a in enumerate(lib.in_avals)
-  ]
-  reads = [f"    status = read_output(c, out{i}, {a.size * a.dtype.itemsize});" for i, a in enumerate(lib.out_avals)]
-  # Chained so that the first failure skips everything after it.
-  writes = "\n".join(f"  if (iree_status_is_ok(status)) {{\n{w[2:]}\n  }}" for w in writes)
-  reads = "\n".join(f"  if (iree_status_is_ok(status)) {{\n{r[2:]}\n  }}" for r in reads)
-  return f"""\
-// The host aotax generates for {n}: it runs IREE's VM program for the function, module.h, whose
-// dispatches library.o holds, on a single-threaded local-sync device.
-#include <stdio.h>
-#include <stdlib.h>
-
-#include "iree/async/util/proactor_pool.h"
-#include "iree/base/threading/numa.h"
-#include "iree/hal/drivers/local_sync/sync_device.h"
-#include "iree/hal/local/loaders/static_library_loader.h"
-#include "iree/runtime/api.h"
-#include "library.h"
-#define EMITC_IMPLEMENTATION
-#include "module.h"
-#include "{n}.h"
-
-#define N_INPUTS {len(lib.in_avals)}
-
-struct {n}_context {{
-  iree_hal_device_t* device;
-  iree_runtime_session_t* session;
-  iree_runtime_call_t call;
-  int call_initialized;
-  // Allocated once; each call copies the caller's inputs into them.
-  iree_hal_buffer_view_t* inputs[N_INPUTS];
-}};
-
-{chr(10).join(shapes)}
-
-static int report(iree_status_t status) {{
-  if (iree_status_is_ok(status)) return 0;
-  iree_status_fprint(stderr, status);
-  iree_status_free(status);
-  return 1;
-}}
-
-static iree_status_t allocate_input({n}_context* c, int i, iree_host_size_t rank, const iree_hal_dim_t* shape, iree_hal_element_type_t element,
-                                    iree_device_size_t bytes) {{
-  iree_hal_buffer_params_t params = {{.type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL | IREE_HAL_MEMORY_TYPE_HOST_VISIBLE,
-                                     .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_MAPPING}};
-  iree_hal_buffer_t* buffer = NULL;
-  iree_status_t status = iree_hal_allocator_allocate_buffer(iree_hal_device_allocator(c->device), params, bytes, &buffer);
-  if (iree_status_is_ok(status)) {{
-    status = iree_hal_buffer_view_create(buffer, rank, shape, element, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, iree_allocator_system(), &c->inputs[i]);
-  }}
-  iree_hal_buffer_release(buffer);
-  return status;
-}}
-
-// The device, with the dispatches looked up in the linked library, buffers from the heap and the
-// asynchronous I/O pool the runtime requires every device to have; then a session with the module.
-static iree_status_t create({n}_context* c) {{
-  iree_allocator_t host = iree_allocator_system();
-  iree_runtime_instance_options_t instance_options;
-  iree_runtime_instance_options_initialize(&instance_options);
-  iree_runtime_instance_t* instance = NULL;
-  iree_hal_executable_loader_t* loader = NULL;
-  iree_hal_allocator_t* allocator = NULL;
-  iree_async_proactor_pool_t* pool = NULL;
-  iree_vm_module_t* module = NULL;
-  const iree_hal_executable_library_query_fn_t libraries[] = {{{query}}};
-
-  iree_status_t status = iree_runtime_instance_create(&instance_options, host, &instance);
-  if (iree_status_is_ok(status)) status = iree_hal_static_library_loader_create(1, libraries, iree_hal_executable_import_provider_null(), host, &loader);
-  if (iree_status_is_ok(status)) status = iree_hal_allocator_create_heap(iree_make_cstring_view("local"), host, host, &allocator);
-  if (iree_status_is_ok(status)) status = iree_async_proactor_pool_create(iree_numa_node_count(), NULL, iree_async_proactor_pool_options_default(), host, &pool);
-  if (iree_status_is_ok(status)) {{
-    iree_hal_device_create_params_t create_params = iree_hal_device_create_params_default();
-    create_params.proactor_pool = pool;
-    iree_hal_sync_device_params_t params;
-    iree_hal_sync_device_params_initialize(&params);
-    status = iree_hal_sync_device_create(iree_make_cstring_view("local-sync"), &params, &create_params, 1, &loader, allocator, host, &c->device);
-  }}
-  if (iree_status_is_ok(status)) {{
-    iree_runtime_session_options_t session_options;
-    iree_runtime_session_options_initialize(&session_options);
-    status = iree_runtime_session_create_with_device(instance, &session_options, c->device, host, &c->session);
-  }}
-  if (iree_status_is_ok(status)) status = {module}_create(iree_runtime_instance_vm_instance(instance), host, &module);
-  if (iree_status_is_ok(status)) status = iree_runtime_session_append_module(c->session, module);
-  if (iree_status_is_ok(status)) status = iree_runtime_call_initialize_by_name(c->session, iree_make_cstring_view("{module}.main"), &c->call);
-  if (iree_status_is_ok(status)) c->call_initialized = 1;
-{chr(10).join(inputs)}
-  iree_vm_module_release(module);
-  iree_async_proactor_pool_release(pool);
-  iree_hal_allocator_release(allocator);
-  iree_hal_executable_loader_release(loader);
-  iree_runtime_instance_release(instance);
-  return status;
-}}
-
-int {n}_create({n}_context** context) {{
-  {n}_context* c = calloc(1, sizeof(*c));
-  if (!c) return report(iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED, "allocating the context"));
-  int failed = report(create(c));
-  if (failed) {{
-    {n}_destroy(c);
-    c = NULL;
-  }}
-  *context = c;
-  return failed;
-}}
-
-void {n}_destroy({n}_context* c) {{
-  if (!c) return;
-  for (int i = 0; i < N_INPUTS; ++i) iree_hal_buffer_view_release(c->inputs[i]);
-  if (c->call_initialized) iree_runtime_call_deinitialize(&c->call);
-  iree_runtime_session_release(c->session);
-  iree_hal_device_release(c->device);
-  free(c);
-}}
-
-// The runtime allocates every result, so each is copied to caller memory and released.
-static iree_status_t read_output({n}_context* c, void* out, iree_device_size_t bytes) {{
-  iree_hal_buffer_view_t* result = NULL;
-  iree_status_t status = iree_runtime_call_outputs_pop_front_buffer_view(&c->call, &result);
-  if (iree_status_is_ok(status)) status = iree_hal_buffer_map_read(iree_hal_buffer_view_buffer(result), 0, out, bytes);
-  iree_hal_buffer_view_release(result);
-  return status;
-}}
-
-{_signature(lib)} {{
-  {n}_context* c = context;
-  iree_runtime_call_reset(&c->call);
-  iree_status_t status = iree_ok_status();
-{writes}
-  for (int i = 0; i < N_INPUTS && iree_status_is_ok(status); ++i) status = iree_runtime_call_inputs_push_back_buffer_view(&c->call, c->inputs[i]);
-  if (iree_status_is_ok(status)) status = iree_runtime_call_invoke(&c->call, 0);
-{reads}
-  return report(status);
-}}
 """
 
 

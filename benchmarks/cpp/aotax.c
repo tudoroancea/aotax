@@ -1,5 +1,4 @@
-// The aotax library behind kernel.h, called through its generated C API: one context, then each
-// call copies the inputs in and the result out.
+// The aotax library behind kernel.h, called through its generated C API.
 #include <stdlib.h>
 
 #include "kernel.h"

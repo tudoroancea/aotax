@@ -12,16 +12,16 @@ name = "aotax"
 version = "0.1.0a1"
 source = { editable = "." }
 dependencies = [
-    { name = "cmake" },
     { name = "iree-base-compiler" },
     { name = "jax" },
-    { name = "ninja" },
     { name = "numpy" },
 ]
 
 [package.dev-dependencies]
 bench = [
     { name = "asdex" },
+    { name = "cmake" },
+    { name = "ninja" },
     { name = "scaly" },
 ]
 dev = [
@@ -32,16 +32,16 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cmake" },
     { name = "iree-base-compiler", specifier = "==3.12.0" },
     { name = "jax", specifier = ">=0.11" },
-    { name = "ninja" },
     { name = "numpy", specifier = ">=2" },
 ]
 
 [package.metadata.requires-dev]
 bench = [
     { name = "asdex", specifier = "==0.5.2" },
+    { name = "cmake" },
+    { name = "ninja" },
     { name = "scaly", git = "https://github.com/PREDICT-EPFL/scaly?branch=main" },
 ]
 dev = [

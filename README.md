@@ -1,7 +1,7 @@
 # aotax
 
 Compile a JAX function ahead of time into a static C library and a header. The program that links
-it needs no Python, no JAX and no just-in-time compiler: only the archive and libm.
+it needs no Python, no JAX and no just-in-time compiler: only the archive, libm and, on macOS, Accelerate.
 
 ```python
 import jax
@@ -34,8 +34,10 @@ hess_destroy(context);
 ```
 
 ```bash
-cc main.c build/hess/libhess.a -lm   # on Linux, also -lpthread -ldl
+cc main.c build/hess/libhess.a -lm
 ```
+
+On macOS, also pass `-framework Accelerate`. The generated header lists the required link flags.
 
 `{name}_call` takes the function's inputs and then its outputs, flattened in JAX's pytree order, as
 pointers to contiguous row-major arrays of `float`, `double`, `int32_t` or `int64_t`. The header
@@ -43,36 +45,54 @@ lists their shapes.
 
 ## How it works
 
-aotax is a thin layer over [IREE](https://iree.dev). It exports the function's StableHLO with
-`jax.export`, and `iree-compile` turns that into two pieces: the dispatches' machine code as an
-object file, and the program that schedules them, IREE's virtual machine (VM) module, written out
-as C. aotax generates the C host that runs that module on IREE's single-threaded `local-sync`
-device behind the three functions above. It then merges the host, the dispatches and IREE's runtime
-into one archive.
+aotax exports the function with `jax.export` as Stable High Level Operations (StableHLO).
+[IREE](https://iree.dev) compiles its dispatches into a machine-code object and writes the host
+program in its hardware abstraction layer (HAL) intermediate representation. aotax reads that
+program with IREE's compiler bindings and generates C that calls the dispatches directly. Branches
+and loops become C control flow; copies and fills run in order when their command buffer executes.
+The archive contains only the generated host and dispatch objects. There is no IREE runtime.
 
-Three compiler flags matter, none of them for speed:
+On macOS, aotax also reads IREE's dispatch sources from the same compilation. Pure matrix products
+call the Basic Linear Algebra Subprograms (BLAS) in Apple's Accelerate framework when they need
+at least 32,768 floating-point operations per matrix for `float64`, or 65,536 for `float32`.
+The host passes their buffer offsets, strides and transpose flags directly; batched products loop
+over BLAS calls. Smaller products, fused operations and layouts the translator cannot map exactly
+keep IREE's dispatch code. Other platforms use IREE for all dispatches.
 
-- `--iree-input-demote-f64-to-f32=false` (and the same for i64), or IREE silently computes in f32;
-- `--iree-llvmcpu-link-embedded=false` with `--iree-llvmcpu-link-static`, because IREE's default
-  self-contained ELF has no f64 `sin`, `cos` or `exp`; the dispatches become a plain object whose
-  calls resolve against libm;
-- `--output-format=vm-c`, so the module comes out as C rather than as bytecode for the runtime to
-  interpret.
+`{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
+Constants are embedded as aligned static data; any constant preparation runs at creation. The host
+allocates no heap memory during calls. It flushes subnormal values to zero during execution, as IREE does,
+and restores the caller's floating-point mode afterward. Inputs bind directly to the caller's arrays, and outputs do too when the
+HAL program gives them a separate buffer. Results that share storage with inputs, constants, or
+other results need a copy.
 
-The PyPI runtime wheel has IREE's runtime sealed inside its Python extension, so on first use aotax
-builds the C runtime from source, at the installed compiler's release and with only the
-`local-sync` driver. This takes about a minute and needs git and a C compiler; CMake and Ninja come
-from PyPI. The result is cached in `~/.cache/aotax` (or `$AOTAX_CACHE`).
+Pointers need no special alignment. A pointer aligned to 64 bytes avoids staging; aotax copies
+less-aligned arrays through context-owned buffers to meet the dispatch code's alignment assumptions.
+Inputs may overlap outputs, in which case the affected inputs are copied before execution. Outputs
+may overlap each other and are written in the order listed in the header.
+
+Before IREE sees the program, aotax replaces every `float64` `exp` with a range reduction and a
+polynomial built from ordinary arithmetic, so that it vectorizes with the rest of its dispatch
+instead of calling libm once per element. It stays within 2 units in the last place (ulp) of libm
+over the whole range, and handles infinities, NaN and underflow to zero.
+
+Four compiler settings matter:
+
+- `--iree-input-demote-f64-to-f32=false` and the same for i64 prevent silent conversion to 32 bits;
+- `--iree-llvmcpu-link-embedded=false` with `--iree-llvmcpu-link-static` produces a plain dispatch
+  object whose remaining `sin` and `cos` calls resolve against libm, which provides their f64 versions;
+- `--iree-llvmcpu-disable-distribution`, because the host runs every dispatch on one thread;
+- `--iree-llvmcpu-loop-unrolling`, which made the benchmark below 5 to 7% faster.
 
 ## Limits
 
 - Code is compiled for the host CPU; there is no cross-compilation.
 - Shapes are static, and inputs and outputs are dense `float32`, `float64`, `int32` or `int64`.
-- Each call copies the inputs into buffers allocated once per context, and copies each result,
-  which the runtime allocates, out to caller memory.
-- The runtime adds about 700 KiB to a program.
-- Tested on macOS on Apple silicon; the Linux path follows the same experiment, which ran on
-  x86-64, but has no tests yet.
+- Host dispatches run on one thread; Accelerate controls threading within BLAS calls. A context
+  cannot be called concurrently; separate contexts can.
+- The translator follows the pinned IREE compiler's executable application binary interface (ABI).
+  Unsupported HAL operations or command-buffer patterns raise an error during compilation.
+- Tested on macOS on Apple silicon. The Linux archive/link path is present but untested.
 
 ## Benchmarks
 
@@ -86,16 +106,20 @@ Benchmark harness, which checks every entry against a dense `jax.hessian` before
 uv run --group bench benchmarks/bench.py
 ```
 
-CPU time per evaluation on an Apple M4 Max, best of three processes:
+CPU time per evaluation on an Apple M4 Max, best of five processes:
 
 | horizon N | Scaly | aotax | ratio |
 |---:|---:|---:|---:|
-| 12 | 14.7 µs | 30.7 µs | 2.09× |
-| 50 | 60.3 µs | 92.2 µs | 1.53× |
-| 200 | 242.7 µs | 322.9 µs | 1.33× |
+| 12 | 15.0 µs | 15.9 µs | 1.06× |
+| 50 | 61.3 µs | 58.2 µs | 0.95× |
+| 200 | 246.4 µs | 202.1 µs | 0.82× |
 
-aotax does not try to compete with Scaly here. The comparison shows what a general JAX function
-costs when it is compiled to C with no tuning.
+The first version of aotax ran IREE's own runtime and took 30.7, 92.2 and 322.9 µs. Generating the
+host as C removed about 14 µs of runtime work from every call. Most of the gain at the larger
+horizons comes from Accelerate: the matrix products of the network's layers, batched over stages
+and Hessian colors, run on Apple's matrix coprocessor. On other platforms they stay in IREE's code.
+The largest remaining cost, about a third of the time at every horizon, is in dispatches where
+IREE fuses a matrix product with elementwise work and generates scalar code for both.
 
 ## License
 
