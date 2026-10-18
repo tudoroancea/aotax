@@ -8,6 +8,8 @@
 - `src/aotax/metal.py`: Metal 4 device hooks for that translator and IREE 3.12's `MTL1` FlatBuffer schema; emits ARC Objective-C.
 - `src/aotax/abi.h`: IREE's executable library ABI v0 (library version 6), as of
   `iree-base-compiler==3.12.0`. Bump the pin, `abi.h` and the version check together.
+- `src/aotax/cpu.py`: CPU compilation splits at executable configurations; this fills vector tile
+  dimensions of extent 2, 4 or 8 in projected-permutation `linalg.generic`s, within 32 elements.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
 - `src/aotax/math.py`: expands f64 `exp` and separates broadcasted libm results from their consumers
   in programs without dot operations.

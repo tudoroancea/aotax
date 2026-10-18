@@ -142,7 +142,11 @@ new modules until their design is settled.
   across the board. Two bounded mechanisms do: power-of-two small-dimension tiles (race_cars N=500
   16% faster) and plain C for dispatches whose tensors all have at most 256 elements (race_cars N=5
   26% faster). Neither changes chain or npmpc.
-- [ ] K1. Power-of-two tile rule through CPU lowering configurations; independent of J.
+- [x] K1. CPU compilation stops at executable configurations, fills vector tile dimensions of
+  extent 2, 4 or 8 in projected-permutation `linalg.generic`s (at most 32 elements per level),
+  then resumes (src/aotax/cpu.py). race_cars N=40/500 16% faster, race_cars_jac N=500 13%; other
+  workloads within ±3%; compilation 0.1 s slower. Reviewed by gpt-6.1-sol (high): scalable tile
+  lists and scalar operands are now left to IREE.
 - [ ] K2. Tiny-dispatch C emitter. Wait for J, then measure on its local stage functions, where a
   whole stage may fit the budget.
 
