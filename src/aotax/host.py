@@ -476,9 +476,9 @@ class _Host:
         elif n == "hal.device.queue.fill":
           written(o.operands[4])
           emit(f"fill({a[4]} + {a[5]}, {a[6]}, {a[7]}, sizeof({_type(o.operands[7].type)}));")
-        elif n == "hal.buffer_view.buffer":
-          assign(o, [a[0]])
-        elif n == "hal.buffer_view.create":
+        elif n in {"hal.buffer_view.buffer", "util.optimization_barrier"}:
+          assign(o, a)
+        elif n in {"hal.buffer_view.create", "hal.buffer.subspan"}:
           assign(o, [f"{a[0]} + {a[1]}"])
         elif n == "hal.buffer.load":
           emit(f"memcpy(&{names[o.results[0]]}, {a[0]} + {a[1]}, sizeof({names[o.results[0]]}));")

@@ -18,8 +18,8 @@ from jax.core import ShapedArray
 
 from aotax.blas import contractions
 from aotax.custom_calls import FFI_HEADER, Foreign, rewrite_custom_calls
-from aotax.exp import expand_exp
 from aotax.host import binding_writes, host
+from aotax.math import expand_math
 
 __all__ = ["Foreign", "Library", "compile"]
 
@@ -103,7 +103,7 @@ def compile(
   wrapped.__name__ = name
   checks = [jax.export.DisabledSafetyCheck.custom_call(target) for target in targets]
   exported = jax.export.export(jax.jit(wrapped), disabled_checks=checks)(*args)
-  text, custom_calls = rewrite_custom_calls(expand_exp(exported.mlir_module()), targets)
+  text, custom_calls = rewrite_custom_calls(expand_math(exported.mlir_module()), targets)
   for aval in (*exported.in_avals, *exported.out_avals):
     if aval.dtype not in DTYPES:
       raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")

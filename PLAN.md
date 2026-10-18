@@ -36,7 +36,40 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
   aotax wins where neural networks dominate (Accelerate, vectorized code) and loses 2-16× on small
   dense dynamics without matrix products, where time spreads over elementwise and transpose
   dispatches, copies, fills and scalar `sin`/`cos`/`tanh` calls.
-- [ ] F2. Sweep all workloads, profile the worst ratios, choose the next optimization round.
+- [x] F2. Sweep all workloads, profile the worst ratios, choose the next optimization round.
+  - [x] Record one full interleaved baseline, three fresh processes per binary.
+  - [x] Measure coloring, arithmetic, Accelerated Linear Algebra (XLA) loop execution and dispatch costs for chain_jac M=3,
+    chain M=17 and both race_cars derivatives at N=500. This depends on baseline compilation.
+  - [x] Test general optimizations identified by the measurements, keeping host edits isolated
+    from H1. Record rejected candidates and compare retained changes in a full sweep.
+  - [x] Run tests, lint, format and types; document results and attempt the Claude review.
+    Commit locally after validation. H1 and the Metal investigation can proceed independently.
+  - The four cases use 14 reverse products, 42 Hessian-vector products, 4 Hessian-vector products,
+    and 6 reverse products respectively. Scaly and asdex agree on the sparse coordinates.
+    Estimated scalar arithmetic is 0.49 / 19.58 / 4.27 / 2.62 million operations for asdex/XLA,
+    versus 0.068 / 4.35 / 0.558 / 0.228 million for Scaly's optimized scalar program.
+    These are compiler estimates before machine-code generation, with loops and calls counted.
+  - XLA's loop wall times are 36 / 1153 / 354 / 211 µs, with all inputs perturbed each iteration
+    and all output entries consumed. XLA uses extra CPU threads. Disabling its parallel task
+    assignment gives 37 / 2168 / 519 / 359 µs; aotax takes 64 / 2441 / 256 / 231 µs on one thread.
+    Scaly takes 3.92 / 1145 / 49.02 / 40.82 µs. The main gap is sparse differentiation and the
+    dense intermediate arrays. Host work outside dispatches and memory operations takes
+    0.9 / 2.3 / 2.8 / 1.4 µs; replacing dispatch kernels with no-ops gives 1.1 / 2.5 / 3.2 / 1.5 µs.
+    The chain Hessian fills 29 MB per call; race-car transpose dispatches take about 55 µs.
+  - Selected broadcast barriers for f64 `sin`, `cos` and `tanh` in programs without dot operations.
+    An interleaved best-of-five comparison cuts race-car Jacobians by 12-13%, with unchanged
+    Hessian times. Matrix-product programs need the exclusion: the same broadcast barriers slow
+    unbumpercars at 8 cars by 7%. Tests: 42 passed, one expected IREE failure. Lint, format and
+    types pass. Both full sweeps, three interleaved processes per binary, pass every dense check.
+    Claude Fable 5.1 at high effort could not review dd21ee4: its API rate limit was reached.
+    The exclusion also covers scalar dot operations in race-car Hessians. Only the three
+    race-car Jacobian kernels change; host and dispatch objects are identical for the other 27 cases.
+    Full-sweep race-car Jacobians improve from 2.67 / 16.67 / 230.98 to 2.30 / 14.61 / 200.17 µs
+    at N=5 / 40 / 500. At N=500, dispatches drop from 114 to 109 and scalar libm results from
+    21,500 to 11,500, counting a paired sin/cos call as two results. The remaining work belongs
+    mostly to dense color batches and their copies, fills and transposes. Next: local stage and
+    link derivatives with sparse block assembly, sparse automatic differentiation that skips
+    zero tangents, and direct lower-triangle decompression in the JAX formulation or asdex.
 
 ## G. Metal GPU path
 

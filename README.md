@@ -92,6 +92,10 @@ polynomial built from ordinary arithmetic, so that it vectorizes with the rest o
 instead of calling libm once per element. It stays within 2 units in the last place (ulp) of libm
 over the whole range, and handles infinities, NaN and underflow to zero.
 
+In programs without StableHLO dot operations, aotax also puts compiler barriers after `float64` `sin`,
+`cos` and `tanh` results that feed broadcasts. IREE then computes these libm results before
+broadcasting them, instead of repeating the calls for the added dimensions.
+
 Four compiler settings matter:
 
 - `--iree-input-demote-f64-to-f32=false` and the same for i64 prevent silent conversion to 32 bits;

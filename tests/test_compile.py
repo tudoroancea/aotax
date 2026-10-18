@@ -25,6 +25,17 @@ def test_f64_transcendentals_and_matmul(tmp_path):
   check(mlp, rng.normal(size=(3, 5)), rng.normal(size=5), tmp_path=tmp_path)
 
 
+def test_shared_math_broadcast(tmp_path):
+  def f(x, w):
+    return jnp.sin(x)[:, None] * w + jnp.cos(x)[None, :] + jnp.tanh(x)[:, None]
+
+  x = np.r_[np.linspace(-20, 20, 65), -1e12, 1e12, -0.0, 0.0]
+  w = np.linspace(-1, 1, x.size**2).reshape(x.size, x.size)
+  loaded = check(f, x, w, tmp_path=tmp_path)
+  assert "stablehlo.optimization_barrier" in (tmp_path / "iree/stablehlo.mlir").read_text()
+  np.testing.assert_allclose(loaded(x + 0.125, w), f(x + 0.125, w), rtol=1e-12, atol=1e-12)
+
+
 def test_pytrees_scalars_and_mixed_dtypes(tmp_path):
   def step(state, k, scale):
     x, v = state["x"], state["v"]

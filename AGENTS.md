@@ -8,7 +8,8 @@
 - `src/aotax/abi.h`: IREE's executable library ABI v0 (library version 6), as of
   `iree-base-compiler==3.12.0`. Bump the pin, `abi.h` and the version check together.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
-- `src/aotax/exp.py`: rewrites f64 `stablehlo.exponential` into a vectorizable polynomial.
+- `src/aotax/math.py`: expands f64 `exp` and separates broadcasted libm results from their consumers
+  in programs without dot operations.
 - `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
 - `benchmarks/`: the npmpc Lagrangian Hessian from Scaly, timed against Scaly's generated C.
 
@@ -36,6 +37,8 @@ uv run --group bench benchmarks/bench.py --reps 5
   Registered adapters borrow inputs, return fresh context buffers, and keep LAPACK `info` as tensor data.
 - Loop result slots avoid live pointers and call operands, including operands that die at the call.
 - User FFI targets require `compile(foreign=...)`; descriptors carry static tensors, `Foreign` requests context scratch, and `load(extra=...)` links implementations.
+- HAL buffer subspans are pointer offsets; optimization barriers are identities in the C host.
+  Both retain their input buffers' aliases for liveness and input staging.
 
 ## Measuring
 
@@ -60,3 +63,18 @@ uv run --group bench benchmarks/bench.py --reps 5
   round-away-from-zero (`frinta`).
 - Dispatches fusing a matmul with a larger broadcast consumer do not recompute the matmul. They are
   slow because IREE generates scalar code with register spills for them.
+
+## Tried and rejected (sparse dynamics, same machine and compiler)
+
+- Disabling vector peeling slows chain_jac M=3 by 17%, chain M=17 by 22%, npmpc N=200 by 7%
+  and the width-16 decoder by 10% in an interleaved comparison.
+- A vectorized f64 `tanh`, with a [9/10] Padé approximation on [-1, 1] and `exp` outside it,
+  stays within 3 units in the last place of libm on 1.1 million samples, including special values. It improves the
+  race-car Jacobians by only 1-3% and barely changes the Hessians; not kept.
+- Barriers after every f64 `sin`, `cos` and `tanh` slow npmpc N=200 by 12%. Keep matrix-product
+  programs' fusion; separate only libm results that feed broadcasts in programs without dot operations.
+  Even the narrower broadcast rule slows unbumpercars at 8 cars by 7% if applied across products.
+- Sparse differentiation dominates the remaining gap: Scaly and asdex agree on the nonzeros,
+  but asdex's color batches do 4.5-11.5 times the estimated scalar arithmetic of Scaly's program
+  on the four profiled cases. Host work outside dispatches and memory operations is only
+  0.9-2.8 µs per call. See PLAN.md, F2.
