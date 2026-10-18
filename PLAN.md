@@ -29,11 +29,11 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 
 Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tolerances.
 
-- [ ] G0. Spike: compile f32 functions with IREE's Metal target, read the HAL program and the
-  executable format (MSL or metallib, entry points, threadgroup sizes, binding and constant
-  layout), run them from a hand-written Metal host, and measure the per-call floor (encode, commit,
-  wait) against the CPU path over sizes. Also measure IREE's own Metal runtime driver as a reference.
-- [ ] G1. If G0 shows a size range where the GPU wins: `aotax.compile(..., device="metal")`, with the
+- [x] G0. Spike: notes/metal.md. A direct Objective-C host runs IREE's MSL kernels, 1.2-2×
+  faster than IREE's Metal runtime. No single evaluation wins on the GPU (one tiny dispatch costs
+  ~110 µs); batches do, from ~64 npmpc Hessians at N=12 or ~16 at N=50 (3.4× and 5.4× at 128).
+- [ ] G1a. Find and cut the ~100 µs gap between an empty command buffer and one tiny dispatch.
+- [ ] G1b. After H1a+b lands: `aotax.compile(..., device="metal")`, with the
   same C API, generated from the same HAL translation (dispatches encoded into one command buffer,
   barriers as memory barriers, transients as shared buffers).
 - [ ] G2. Add f32 GPU columns to the benchmark sweep and map where CPU or GPU wins.
