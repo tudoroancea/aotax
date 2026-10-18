@@ -56,6 +56,26 @@ def test_tile_levels_and_budget():
   assert "vector_common_parallel = [1, 1, 2]" in dynamic
 
 
+def test_scalar_operands_and_scalable_tiles():
+  text = """
+  module {
+    func.func @tiles(%s: f64, %out: tensor<8xf64>) -> tensor<8xf64> {
+      %0 = linalg.generic {
+        indexing_maps = [affine_map<(d0) -> ()>, affine_map<(d0) -> (d0)>], iterator_types = ["parallel"],
+        lowering_config = #iree_cpu.lowering_config<vector_common_parallel = [2]>
+      } ins(%s : f64) outs(%out : tensor<8xf64>) {
+      ^bb0(%a: f64, %b: f64):
+        linalg.yield %a : f64
+      } -> tensor<8xf64>
+      return %0 : tensor<8xf64>
+    }
+  }
+  """
+  assert "vector_common_parallel = [8]" in fill_small_tiles(text)
+  scalable = text.replace("vector_common_parallel = [2]", "vector_common_parallel = [[4], true]")
+  assert "vector_common_parallel = [[4]," in fill_small_tiles(scalable)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("extent", [3, 4, 8])
 def test_permutations(tmp_path, dtype, extent):

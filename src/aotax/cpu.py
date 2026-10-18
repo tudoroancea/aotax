@@ -31,6 +31,8 @@ def fill_small_tiles(text: str) -> str:
       if any(not m.is_projected_permutation for m in maps):
         continue
       for value, indexing in zip(op.operands, maps, strict=True):
+        if not isinstance(value.type, ir.ShapedType):
+          continue
         for extent, expr in zip(ir.ShapedType(value.type).shape, indexing.results, strict=True):
           if extent > 0:
             dims[ir.AffineDimExpr(expr).position] = extent
@@ -46,7 +48,7 @@ def fill_small_tiles(text: str) -> str:
                 tile = candidate
         return f"{match[1]} = [{', '.join(map(str, tile))}]"
 
-      updated = re.sub(r"(vector_common_parallel|vector_reduction|vector_inner_parallel) = \[([^]]*)\]", fill, config)
+      updated = re.sub(r"\b(vector_common_parallel|vector_reduction|vector_inner_parallel) = \[([0-9, ]*)\]", fill, config)
       if updated != config:
         op.attributes["lowering_config"] = ir.Attribute.parse(updated)
     return module.operation.get_asm(enable_debug_info=True)
