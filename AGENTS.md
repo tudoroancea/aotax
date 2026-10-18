@@ -35,6 +35,7 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Custom calls keep tensor results until HAL; exporting empty destination buffers can reorder reads before calls.
   Registered adapters borrow inputs, return fresh context buffers, and keep LAPACK `info` as tensor data.
 - Loop result slots avoid live pointers and call operands, including operands that die at the call.
+- User FFI targets require `compile(foreign=...)`; descriptors carry static tensors, `Foreign` requests context scratch, and `load(extra=...)` links implementations.
 
 ## Measuring
 

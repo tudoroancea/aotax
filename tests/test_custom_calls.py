@@ -297,3 +297,193 @@ int main(void) {{
   subprocess.run([binary], check=True)
   symbols = subprocess.run(["nm", "-g", tmp_path / "libsolve.a"], check=True, capture_output=True, text=True).stdout
   assert "aotax_cc" not in symbols
+
+
+def foreign_step(x, count, **kwargs):
+  return jax.ffi.ffi_call("test_step", (jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct((), np.int64)), **kwargs)(x, count)
+
+
+def build_foreign(lib, source):
+  path = lib.header.parent / "foreign.c"
+  path.write_text(f'#include "{lib.header.name}"\n' + source)
+  obj = path.with_suffix(".o")
+  subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-O2", "-fPIC", "-c", path, "-o", obj], check=True)
+  return obj
+
+
+@pytest.mark.parametrize(
+  "dtype,ctype,tag", [(np.float32, "float", "F32"), (np.float64, "double", "F64"), (np.int32, "int32_t", "I32"), (np.int64, "int64_t", "I64")]
+)
+def test_foreign_loops(tmp_path, dtype, ctype, tag):
+  def loops(x, limit):
+    def step(state):
+      old, current, count = state
+      result, count = foreign_step(current + old, count)
+      return current, result, count
+
+    fixed = jax.lax.fori_loop(0, 4, lambda i, state: step(state), (x, x, np.int64(0)))
+    return jax.lax.while_loop(lambda state: state[2] < limit, step, fixed), x
+
+  x = np.arange(6, dtype=dtype).reshape(2, 3)
+  if dtype == np.int64:
+    x += 1 << 40
+  lib = aotax.compile(loops, x, np.int64(7), out=tmp_path, foreign={"test_step": aotax.Foreign("user_step", scratch=64)})
+  obj = build_foreign(
+    lib,
+    f"""int user_step(const aotax_ffi_tensor* in, size_t ni, const aotax_ffi_tensor* out, size_t no, void* scratch) {{
+  if (ni != 2 || no != 2 || !scratch || (uintptr_t)scratch % 64) return 1;
+  if (in[0].dtype != AOTAX_FFI_{tag} || out[0].dtype != in[0].dtype || in[1].dtype != AOTAX_FFI_I64) return 2;
+  if (in[1].rank || in[1].shape || out[1].rank || out[1].shape) return 3;
+  if (in[0].data == out[0].data || in[1].data == out[1].data || out[0].data == out[1].data) return 4;
+  size_t n = 1;
+  for (size_t i = 0; i < in[0].rank; ++i) {{
+    if (in[0].shape[i] != out[0].shape[i]) return 5;
+    n *= in[0].shape[i];
+  }}
+  int64_t* count = scratch;
+  *count = *(const int64_t*)in[1].data;
+  for (size_t i = 0; i < n; ++i) (({ctype}*)out[0].data)[i] = ((const {ctype}*)in[0].data)[i] + *count;
+  *(int64_t*)out[1].data = *count + 1;
+  return 0;
+}}
+""",
+  )
+  loaded = lib.load(extra=[obj])
+  for limit in (0, 4, 5, 9, 7):
+    old, current = x.copy(), x.copy()
+    for count in range(max(4, limit)):
+      old, current = current, current + old + count
+    result, original = loaded(x, np.int64(limit))
+    for got, expected in zip(result, (old, current, max(4, limit)), strict=True):
+      np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(original, x)
+  assert "int user_step(const aotax_ffi_tensor*" in lib.header.read_text()
+  symbols = subprocess.run(["nm", "-g", lib.archive], check=True, capture_output=True, text=True).stdout
+  assert "U _user_step" in symbols if sys.platform == "darwin" else "U user_step" in symbols
+  source = tmp_path / "main.c"
+  source.write_text(f"""#include "loops.h"
+int main(void) {{
+  loops_context* c;
+  {ctype} x[6] = {{0}}, old[6], current[6], original[6];
+  int64_t limit = 7, count;
+  if (loops_create(&c) || loops_call(c, x, &limit, old, current, &count, original)) return 1;
+  loops_destroy(c);
+  return count != 7 || current[0] != 46;
+}}
+""")
+  binary = tmp_path / "main"
+  subprocess.run([os.environ.get("CC", "cc"), source, lib.archive, obj, *aotax.SYSTEM_LIBS, "-o", binary], check=True)
+  subprocess.run([binary], check=True)
+
+
+def test_foreign_shapes_and_no_scratch(tmp_path):
+  def fn(x):
+    a, _ = foreign_step(x, np.int64(2))
+    b, _ = foreign_step(x.reshape(-1), np.int64(3))
+    return a, b
+
+  x = np.arange(6.0).reshape(2, 3)
+  lib = aotax.compile(fn, x, out=tmp_path, foreign={"test_step": "user_step"})
+  obj = build_foreign(
+    lib,
+    """int user_step(const aotax_ffi_tensor* in, size_t ni, const aotax_ffi_tensor* out, size_t no, void* scratch) {
+  if (scratch) return 1;
+  size_t n = 1;
+  for (size_t i = 0; i < in[0].rank; ++i) n *= in[0].shape[i];
+  for (size_t i = 0; i < n; ++i) ((double*)out[0].data)[i] = ((const double*)in[0].data)[i] + *(const int64_t*)in[1].data;
+  *(int64_t*)out[1].data = 0;
+  return 0;
+}
+""",
+  )
+  for got, expected in zip(lib.load(extra=[obj])(x), (x + 2, x.ravel() + 3), strict=True):
+    np.testing.assert_array_equal(got, expected)
+  with pytest.raises(RuntimeError, match=r"load\(extra=.*") as error:
+    lib.load()
+  assert "user_step" in str(error.value)
+
+
+@pytest.mark.parametrize(
+  "options,attrs,message",
+  [
+    ({"has_side_effect": True}, {}, "side effects"),
+    ({"input_output_aliases": {0: 0}}, {}, "aliases"),
+    ({"input_layouts": [(1, 0), ()]}, {}, "operand_layouts"),
+    ({"output_layouts": [(1, 0), ()]}, {}, "result_layouts"),
+    ({}, {"scale": np.float64(2)}, "backend attributes"),
+    ({}, {"opaque": "state"}, "backend attributes"),
+    ({"custom_call_api_version": 2, "legacy_backend_config": "state"}, {}, "api_version"),
+  ],
+)
+def test_foreign_rejects_options(tmp_path, options, attrs, message):
+  def fn(x):
+    return jax.ffi.ffi_call("test_step", (jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ShapeDtypeStruct((), np.int64)), **options)(
+      x, np.int64(0), **attrs
+    )
+
+  with pytest.raises(ValueError, match=message):
+    aotax.compile(fn, np.ones((2, 3)), out=tmp_path, foreign={"test_step": "user_step"})
+
+
+def test_foreign_registry_and_tokens(tmp_path):
+  with pytest.raises(ValueError, match="C identifier"):
+    aotax.Foreign("not a symbol")
+  with pytest.raises(ValueError, match="scratch"):
+    aotax.Foreign("user_step", scratch=-1)
+  with pytest.raises(ValueError, match="nonempty target"):
+    aotax.compile(lambda x: x, np.ones(3), name="fn", out=tmp_path, foreign={"": "user_step"})
+  with pytest.raises(ValueError, match="test_step"):
+    aotax.compile(lambda x: foreign_step(x, np.int64(0)), np.ones(3), name="fn", out=tmp_path, foreign={"another": "user_step"})
+
+  def fn(x):
+    y, _ = jax.ffi.ffi_call("test_step", (jax.ShapeDtypeStruct(x.shape, x.dtype), jax.ffi.abstract_token))(x)
+    return y
+
+  with pytest.raises(ValueError, match="tokens and ordered effects"):
+    aotax.compile(fn, np.ones(3), out=tmp_path, foreign={"test_step": "user_step"})
+
+
+def test_foreign_execution_error_and_header(tmp_path):
+  def fn(x):
+    return foreign_step(x, np.int64(0))
+
+  lib = aotax.compile(fn, np.ones(3), out=tmp_path, foreign={"test_step": "user_step"})
+  obj = build_foreign(
+    lib,
+    """int user_step(const aotax_ffi_tensor* in, size_t ni, const aotax_ffi_tensor* out, size_t no, void* scratch) {
+  return 7;
+}
+""",
+  )
+  loaded = lib.load(extra=[obj])
+  tiny = np.array([1e-310])
+  before = tiny * 1e300
+  with pytest.raises(RuntimeError, match="fn_call failed"):
+    loaded(np.ones(3))
+  np.testing.assert_array_equal(tiny * 1e300, before)
+  source = tmp_path / "bad.c"
+  source.write_text('#include "fn.h"\nint user_step(double* x) { return 0; }\n')
+  result = subprocess.run([os.environ.get("CC", "cc"), "-c", source, "-o", tmp_path / "bad.o"], check=False, capture_output=True, text=True)
+  assert result.returncode != 0
+  assert "user_step" in result.stderr
+
+
+@lapack
+def test_foreign_and_lapack(tmp_path):
+  def fn(a, b):
+    return foreign_step(jnp.linalg.solve(a, b), np.int64(0))
+
+  a, b = np.eye(3) * 2, np.arange(3.0)
+  lib = aotax.compile(fn, a, b, out=tmp_path, foreign={"test_step": "user_step"})
+  obj = build_foreign(
+    lib,
+    """int user_step(const aotax_ffi_tensor* in, size_t ni, const aotax_ffi_tensor* out, size_t no, void* scratch) {
+  for (int i = 0; i < 3; ++i) ((double*)out[0].data)[i] = ((const double*)in[0].data)[i] * 2;
+  *(int64_t*)out[1].data = 1;
+  return 0;
+}
+""",
+  )
+  got, count = lib.load(extra=[obj])(a, b)
+  np.testing.assert_array_equal(got, b)
+  assert count == 1

@@ -100,6 +100,65 @@ Four compiler settings matter:
 - `--iree-llvmcpu-disable-distribution`, because the host runs every dispatch on one thread;
 - `--iree-llvmcpu-loop-unrolling`, which made the benchmark below 5 to 7% faster.
 
+## Foreign functions
+
+Declare user C targets explicitly when compiling a JAX foreign function interface (FFI) call:
+
+```python
+def twice(x):
+  return jax.ffi.ffi_call("twice", jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+
+lib = aotax.compile(twice, np.ones(8), out="build/twice", foreign={"twice": "my_twice"})
+twice_loaded = lib.load(extra=["my_twice.o"])
+```
+
+The generated `twice.h` declares the C symbol and the descriptor types. Include it in `my_twice.c`
+so the compiler checks the implementation's signature:
+
+```c
+#include "twice.h"
+
+int my_twice(const aotax_ffi_tensor* inputs, size_t ninputs,
+             const aotax_ffi_tensor* results, size_t nresults, void* scratch) {
+  size_t n = 1;
+  for (size_t i = 0; i < inputs[0].rank; ++i) n *= inputs[0].shape[i];
+  const double* x = inputs[0].data;
+  double* y = results[0].data;
+  for (size_t i = 0; i < n; ++i) y[i] = 2 * x[i];
+  return 0;
+}
+```
+
+Each descriptor has `void* data`, `aotax_ffi_dtype dtype`, `size_t rank` and
+`const int64_t* shape`. The dtype is `AOTAX_FFI_F32`, `AOTAX_FFI_F64`, `AOTAX_FFI_I32` or
+`AOTAX_FFI_I64`. Shapes are static, arrays are dense and row-major, and scalars have rank zero
+and a null shape pointer. One C symbol can handle several shapes and signatures; the header
+lists every specialization's inputs, results and scratch size.
+
+Calls are synchronous. Inputs are borrowed and immutable; fill every result in its fresh buffer
+and retain no pointers after returning. Return zero on success or nonzero for an execution error.
+Keep numerical status, such as solver convergence, in tensor results. For temporary storage,
+use `aotax.Foreign("my_twice", scratch=256)` in the registry. Scratch lives in the context,
+is aligned to 64 bytes and is reused without clearing. With no scratch request the pointer is null.
+
+The archive leaves user symbols unresolved. Compile the implementation, then link it after the archive:
+
+```sh
+cc -O2 -fPIC -I build/twice -c my_twice.c -o my_twice.o
+cc main.c -I build/twice build/twice/libtwice.a my_twice.o -lm -framework Accelerate
+```
+
+Omit `-framework Accelerate` outside macOS. `load(extra=[...])` accepts the same objects, libraries
+and link flags after the archive. An XLA-registered handler has a different call-frame ABI;
+aotax never calls it. Only explicit registry entries receive JAX export exemptions, and no XLA
+registration is needed to compile them. CPU tensor calls work inside JAX loops. Backend attributes,
+opaque state, effects, tokens, non-row-major layouts and input/output alias requests raise compilation
+errors. Pass attribute values as tensor operands instead.
+
+IREE 3.12 can crash on loops carrying several scalar `float64` foreign results. Returning solver
+statistics in a vector avoids this compiler failure.
+
 ## Limits
 
 - Code is compiled for the host CPU; there is no cross-compilation.
@@ -110,9 +169,9 @@ Four compiler settings matter:
   Unsupported HAL operations or command-buffer patterns raise an error during compilation.
 - Custom calls support JAX's CPU `lapack_{s,d}getrf_ffi`, `lapack_{s,d}potrf_ffi` and
   `lapack_{s,d}trsm_ffi` targets on macOS. These cover ordinary `jnp.linalg.solve`, Cholesky,
-  triangular solves and SciPy-style LU and Cholesky solves. Other targets, user foreign calls,
-  and LAPACK calls on other platforms raise an error during compilation. Adapters require static,
-  nonzero matrix and batch dimensions.
+  triangular solves and SciPy-style LU and Cholesky solves. Explicitly declared user targets use
+  the C convention above. Undeclared targets and LAPACK calls on other platforms raise an error
+  during compilation. LAPACK adapters require static, nonzero matrix and batch dimensions.
 - Tested on macOS on Apple silicon. The Linux archive/link path is present but untested.
 
 ## Benchmarks

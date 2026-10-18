@@ -6,7 +6,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,11 +17,11 @@ from iree.compiler.tools import binaries
 from jax.core import ShapedArray
 
 from aotax.blas import contractions
-from aotax.custom_calls import rewrite_custom_calls
+from aotax.custom_calls import FFI_HEADER, Foreign, rewrite_custom_calls
 from aotax.exp import expand_exp
 from aotax.host import binding_writes, host
 
-__all__ = ["Library", "compile"]
+__all__ = ["Foreign", "Library", "compile"]
 
 # The dtypes a library can take and return, and their C types.
 DTYPES = {
@@ -72,12 +72,14 @@ class Library:
   in_tree: Any
   out_tree: Any
 
-  def load(self) -> Callable[..., Any]:
-    """The library as a Python function of NumPy arrays, through a shared library linked from the archive."""
-    return _Loaded(self)
+  def load(self, *, extra: Sequence[str | Path] = ()) -> Callable[..., Any]:
+    """Load as a Python function, linking `extra` objects, libraries or flags after the archive."""
+    return _Loaded(self, extra=extra)
 
 
-def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | None = None) -> Library:
+def compile(
+  fn: Callable[..., Any], *args: Any, out: str | Path, name: str | None = None, foreign: Mapping[str, str | Foreign] | None = None
+) -> Library:
   """Compile `fn` at the shapes and dtypes of `args`, arrays or `jax.ShapeDtypeStruct`s, into `out`.
 
   `out` receives `{name}.h` and `lib{name}.a`, and `iree/` beneath it the intermediate files: the
@@ -86,6 +88,10 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
   name = name or getattr(fn, "__name__", "")
   if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
     raise ValueError(f"{name!r} is not a C identifier; pass name=")
+  targets = {target: Foreign(spec) if isinstance(spec, str) else spec for target, spec in (foreign or {}).items()}
+  for target, spec in targets.items():
+    if not isinstance(target, str) or not target or not isinstance(spec, Foreign):
+      raise ValueError("aotax: foreign must map nonempty target names to C symbols or Foreign declarations")
   out = Path(out)
   work = out / "iree"
   work.mkdir(parents=True, exist_ok=True)
@@ -95,13 +101,14 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
     return fn(*a)
 
   wrapped.__name__ = name
-  exported = jax.export.export(jax.jit(wrapped))(*args)
+  checks = [jax.export.DisabledSafetyCheck.custom_call(target) for target in targets]
+  exported = jax.export.export(jax.jit(wrapped), disabled_checks=checks)(*args)
+  text, custom_calls = rewrite_custom_calls(expand_exp(exported.mlir_module()), targets)
   for aval in (*exported.in_avals, *exported.out_avals):
     if aval.dtype not in DTYPES:
       raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
   library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree)
 
-  text, custom_calls = rewrite_custom_calls(expand_exp(exported.mlir_module()))
   (work / "stablehlo.mlir").write_text(text)
   sources = work / "sources"
   sources.mkdir(exist_ok=True)
@@ -121,7 +128,16 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
     ],
     check=True,
   )
-  library.header.write_text(_header(library))
+  declarations = []
+  for spec in dict.fromkeys(custom_calls.values()):
+    if spec.foreign is None:
+      continue
+    tensors = [
+      *(f"in{i}: {t.dtype}{list(t.shape)}" for i, t in enumerate(spec.inputs)),
+      *(f"out{i}: {t.dtype}{list(t.shape)}" for i, t in enumerate(spec.results)),
+    ]
+    declarations.append(f"// {spec.target!r}: {', '.join(tensors)}; scratch: {spec.scratch} bytes.\n{spec.foreign.declaration}")
+  library.header.write_text(_header(library, "\n".join(declarations)))
   queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
   blas = contractions(sources) if sys.platform == "darwin" else {}
   (work / "host.c").write_text(
@@ -176,9 +192,17 @@ def _signature(lib: Library) -> str:
   return f"int {lib.name}_call({', '.join([f'{lib.name}_context* context', *inputs, *outputs])})"
 
 
-def _header(lib: Library) -> str:
+def _header(lib: Library, foreign: str = "") -> str:
   shapes = [f"//   in{i}: {_c_type(a)}{list(a.shape)}" for i, a in enumerate(lib.in_avals)]
   shapes += [f"//   out{i}: {_c_type(a)}{list(a.shape)}" for i, a in enumerate(lib.out_avals)]
+  if foreign:
+    foreign = f"""
+// Link implementations of these foreign symbols after lib{lib.name}.a.
+// Inputs are borrowed and immutable; results are fresh row-major buffers to fill completely.
+// Return 0 on success, nonzero on execution failure. Do not retain any pointers after return.
+// Scratch is 64-byte aligned, reused without clearing, and NULL when no bytes were requested.
+{foreign}
+"""
   return f"""\
 // {lib.name}, compiled from a JAX function by aotax. Link lib{lib.name}.a, then {" ".join(SYSTEM_LIBS)}.
 // Arrays are contiguous and row-major:
@@ -191,6 +215,8 @@ def _header(lib: Library) -> str:
 #pragma once
 
 #include <stdint.h>
+{"#include <stddef.h>" if foreign else ""}
+{FFI_HEADER if foreign else ""}
 
 #ifdef __cplusplus
 extern "C" {{
@@ -201,6 +227,7 @@ typedef struct {lib.name}_context {lib.name}_context;
 int {lib.name}_create({lib.name}_context** context);
 {_signature(lib)};
 void {lib.name}_destroy({lib.name}_context* context);
+{foreign}
 
 #ifdef __cplusplus
 }}
@@ -209,13 +236,23 @@ void {lib.name}_destroy({lib.name}_context* context);
 
 
 class _Loaded:
-  def __init__(self, lib: Library):
+  def __init__(self, lib: Library, *, extra: Sequence[str | Path] = ()):
     self._lib = lib
     prefix = "_" if sys.platform == "darwin" else ""
     keep = [f"-Wl,-u,{prefix}{lib.name}_{fn}" for fn in ("create", "call", "destroy")]
     with tempfile.NamedTemporaryFile(dir=lib.archive.parent, suffix=".dylib" if sys.platform == "darwin" else ".so") as shared:
-      subprocess.run([os.environ.get("CC", "cc"), "-shared", "-o", shared.name, *keep, lib.archive, *SYSTEM_LIBS], check=True)
-      self._dll = ctypes.CDLL(shared.name)
+      linked = subprocess.run(
+        [os.environ.get("CC", "cc"), "-shared", "-o", shared.name, *keep, lib.archive, *extra, *SYSTEM_LIBS],
+        check=False,
+        capture_output=True,
+        text=True,
+      )
+      if linked.returncode:
+        raise RuntimeError(f"{lib.name}: linking failed; pass foreign objects or libraries with load(extra=[...])\n{linked.stderr}")
+      try:
+        self._dll = ctypes.CDLL(shared.name)
+      except OSError as error:
+        raise RuntimeError(f"{lib.name}: loading failed; pass foreign objects or libraries with load(extra=[...])\n{error}") from error
     self._call = getattr(self._dll, f"{lib.name}_call")
     self._call.argtypes = [ctypes.c_void_p] * (1 + len(lib.in_avals) + len(lib.out_avals))
     self._destroy = getattr(self._dll, f"{lib.name}_destroy")

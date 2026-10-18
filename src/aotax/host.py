@@ -506,7 +506,7 @@ class _Host:
           for result, tensor in zip(o.results, spec.results, strict=True):
             allocate(o, result, tensor.size)
           pointers = [*a, *(names[r] for r in o.results), scratch]
-          emit(f'if ({symbol}({", ".join(pointers)})) return fail("custom call {spec.target} failed");')
+          emit(f"if ({symbol}({', '.join(pointers)})) return fail({json.dumps(f'custom call {spec.target} failed')});")
         elif n == "util.return":
           if main:
             for i, value in enumerate(a):
@@ -582,7 +582,7 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas or custom_calls else ""}
+{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas or any(s.foreign is None for s in custom_calls.values()) else ""}
 #include "{n}.h"
 
 {chr(10).join(f"extern const library_header** {q}(uint32_t, const environment*);" for q in queries)}

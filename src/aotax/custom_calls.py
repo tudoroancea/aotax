@@ -1,4 +1,4 @@
-"""Preserve supported tensor calls through HAL and generate synchronous LAPACK adapters."""
+"""Preserve tensor calls through HAL and generate synchronous C adapters."""
 
 import math
 import re
@@ -10,6 +10,38 @@ from iree.compiler import ir as mlir
 
 ir: Any = mlir
 
+FFI_TYPES = {"f32": "AOTAX_FFI_F32", "f64": "AOTAX_FFI_F64", "i32": "AOTAX_FFI_I32", "i64": "AOTAX_FFI_I64"}
+
+FFI_HEADER = """#ifndef AOTAX_FFI_H
+#define AOTAX_FFI_H
+typedef enum { AOTAX_FFI_F32, AOTAX_FFI_F64, AOTAX_FFI_I32, AOTAX_FFI_I64 } aotax_ffi_dtype;
+typedef struct {
+  void* data;
+  aotax_ffi_dtype dtype;
+  size_t rank;
+  const int64_t* shape;
+} aotax_ffi_tensor;
+#endif
+"""
+
+
+@dataclass(frozen=True)
+class Foreign:
+  """A synchronous C target with context-owned scratch bytes."""
+
+  symbol: str
+  scratch: int = 0
+
+  def __post_init__(self):
+    if not isinstance(self.symbol, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.symbol):
+      raise ValueError(f"aotax: foreign symbol {self.symbol!r} is not a C identifier")
+    if not isinstance(self.scratch, int) or self.scratch < 0:
+      raise ValueError("aotax: foreign scratch must be a nonnegative integer byte count")
+
+  @property
+  def declaration(self):
+    return f"int {self.symbol}(const aotax_ffi_tensor* inputs, size_t ninputs, const aotax_ffi_tensor* results, size_t nresults, void* scratch);"
+
 
 @dataclass(frozen=True)
 class Tensor:
@@ -18,7 +50,7 @@ class Tensor:
 
   @property
   def size(self):
-    return math.prod(self.shape) * (8 if self.dtype == "f64" else 4)
+    return math.prod(self.shape) * (8 if self.dtype in {"f64", "i64"} else 4)
 
 
 @dataclass(frozen=True)
@@ -28,9 +60,12 @@ class Call:
   results: tuple[Tensor, ...]
   config: tuple[tuple[str, int], ...]
   attributes: tuple[tuple[str, str], ...]
+  foreign: Foreign | None = None
 
   @property
   def scratch(self):
+    if self.foreign is not None:
+      return self.foreign.scratch
     return math.prod(self.inputs[0].shape[-2:]) * (8 if self.inputs[0].dtype == "f64" else 4) if "trsm" not in self.target else 0
 
   def validate_hal(self, inputs, results):
@@ -38,9 +73,21 @@ class Call:
       raise ValueError(f"aotax: {self.target}: lowered call signature differs from registered tensor signature")
 
   def adapter(self, symbol):
+    args = [*(f"const void* p{i}" for i in range(len(self.inputs))), *(f"void* r{i}" for i in range(len(self.results))), "void* scratch"]
+    if self.foreign is not None:
+      lines = []
+      for label, tensors in (("p", self.inputs), ("r", self.results)):
+        descriptors = []
+        for i, tensor in enumerate(tensors):
+          shape = f"{label}{i}_shape" if tensor.shape else "NULL"
+          if tensor.shape:
+            lines.append(f"  static const int64_t {shape}[] = {{{', '.join(map(str, tensor.shape))}}};")
+          descriptors.append(f"{{(void*){label}{i}, {FFI_TYPES[tensor.dtype]}, {len(tensor.shape)}, {shape}}}")
+        lines.append(f"  const aotax_ffi_tensor {label}[] = {{{', '.join(descriptors) or '{0}'}}};")
+      lines.append(f"  return {self.foreign.symbol}(p, {len(self.inputs)}, r, {len(self.results)}, scratch);")
+      return f"static int {symbol}({', '.join(args)}) {{\n" + "\n".join(lines) + "\n}\n"
     t = "double" if self.inputs[0].dtype == "f64" else "float"
     prefix = "d" if t == "double" else "s"
-    args = [*(f"const void* p{i}" for i in range(len(self.inputs))), *(f"void* r{i}" for i in range(len(self.results))), "void* scratch"]
     a = self.inputs[0].shape
     m, n = a[-2:]
     config = dict(self.config)
@@ -75,21 +122,63 @@ class Call:
     return f"static int {symbol}({', '.join(args)}) {{\n{body}\n  return 0;\n}}\n"
 
 
-def _specialize(op):
+def _specialize(op, foreign):
   target = op.attributes["call_target_name"].value
 
   def require(condition, reason):
     if not condition:
       raise ValueError(f"aotax: custom call {target}: {reason}")
 
+  require("has_side_effect" not in op.attributes or not op.attributes["has_side_effect"].value, "side effects are unsupported")
+  require("api_version" not in op.attributes or int(op.attributes["api_version"].value) == 4, "expected typed FFI api_version 4")
+  require("called_computations" not in op.attributes or not len(op.attributes["called_computations"]), "called computations are unsupported")
+  attributes = tuple((key, str(op.attributes[key])) for key in op.attributes)
+  if target in foreign:
+    allowed = {
+      "call_target_name",
+      "has_side_effect",
+      "api_version",
+      "called_computations",
+      "mhlo.backend_config",
+      "backend_config",
+      "operand_layouts",
+      "result_layouts",
+      "output_operand_aliases",
+    }
+    require("output_operand_aliases" not in op.attributes or not len(op.attributes["output_operand_aliases"]), "output aliases are unsupported")
+    require(all(key in allowed for key in op.attributes), "unsupported attributes or opaque state")
+    for key in ("mhlo.backend_config", "backend_config"):
+      if key in op.attributes:
+        value = op.attributes[key]
+        require(
+          (isinstance(value, ir.DictAttr) and not len(value)) or (isinstance(value, ir.StringAttr) and not value.value),
+          "backend attributes and opaque configuration are unsupported; pass values as tensor operands",
+        )
+
+    def tensor(v):
+      require(isinstance(v.type, ir.RankedTensorType), "requires ranked tensors; tokens and ordered effects are unsupported")
+      t = ir.RankedTensorType(v.type)
+      require(not t.encoding and all(n >= 0 for n in t.shape), "requires static dense tensors")
+      require(str(t.element_type) in FFI_TYPES, "unsupported dtype")
+      return Tensor(tuple(t.shape), str(t.element_type))
+
+    inputs, results = tuple(map(tensor, op.operands)), tuple(map(tensor, op.results))
+    for key, tensors in (("operand_layouts", inputs), ("result_layouts", results)):
+      if key not in op.attributes:
+        continue
+      require(len(op.attributes[key]) == len(tensors), f"incompatible {key}")
+      for layout, t in zip(op.attributes[key], tensors, strict=True):
+        require(
+          isinstance(layout, ir.DenseIntElementsAttr) and tuple(layout) == tuple(reversed(range(len(t.shape)))),
+          f"unsupported {key}: requires row-major layout",
+        )
+    return Call(target, inputs, results, (), attributes, foreign[target])
+
   match = re.fullmatch(r"lapack_([sd])(getrf|potrf|trsm)_ffi", target)
   if match is None:
     raise ValueError(f"aotax: custom call {target}: unsupported target")
   require(sys.platform == "darwin", "LAPACK adapters require macOS Accelerate; other platforms are untested")
   dtype, kind = ("f64" if match[1] == "d" else "f32"), match[2]
-  require("has_side_effect" not in op.attributes or not op.attributes["has_side_effect"].value, "side effects are unsupported")
-  require("api_version" not in op.attributes or int(op.attributes["api_version"].value) == 4, "expected typed FFI api_version 4")
-  require("called_computations" not in op.attributes or not len(op.attributes["called_computations"]), "called computations are unsupported")
 
   def tensor(v):
     require(isinstance(v.type, ir.RankedTensorType), "requires ranked tensors")
@@ -131,11 +220,10 @@ def _specialize(op):
       rank = len(t.shape)
       expected = (rank - 2, rank - 1, *reversed(range(rank - 2))) if t.dtype == dtype else tuple(reversed(range(rank)))
       require(isinstance(layout, ir.DenseIntElementsAttr) and tuple(layout) == expected, f"unsupported {key}: expected {expected}")
-  attributes = tuple((key, str(op.attributes[key])) for key in op.attributes)
   return Call(target, inputs, results, tuple(sorted(config.items())), attributes)
 
 
-def rewrite_custom_calls(text: str) -> tuple[str, dict[str, Call]]:
+def rewrite_custom_calls(text: str, foreign: dict[str, Foreign] | None = None) -> tuple[str, dict[str, Call]]:
   with ir.Context() as ctx:
     ctx.allow_unregistered_dialects = True
     module = ir.Module.parse(text)
@@ -153,7 +241,7 @@ def rewrite_custom_calls(text: str) -> tuple[str, dict[str, Call]]:
     symbols = {o.attributes["sym_name"].value for o in module.body.operations if "sym_name" in o.attributes}
     registry = {}
     for op in calls:
-      spec = _specialize(op)
+      spec = _specialize(op, foreign or {})
       index = len(registry)
       while (symbol := f"aotax_cc{index}") in symbols:
         index += 1
