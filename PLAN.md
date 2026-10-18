@@ -118,10 +118,23 @@ new modules until their design is settled.
 - [ ] I. Polynomial approximations opt-in: one `compile` flag, off by default. Off: libm for f64
   `exp`, and an accurate path for float32 `sin`/`cos` and other functions IREE approximates. On:
   aotax's polynomial `exp` and IREE's approximations.
-- [ ] J. Structured derivatives: a general utility that recognizes stage structure in a JAX program
-  (vmapped stages, sums of element functions over index windows, scans) and assembles sparse
-  Jacobians and Hessians from small local derivatives, falling back to asdex. Design spike first,
-  measured against asdex and Scaly on chain, race_cars, npmpc and unbumpercars.
+- [x] J0. Structured derivatives spike (notes/structured-derivatives.md). Prototypes differentiate
+  small local programs with JAX and assemble only the needed entries into static coordinates. With
+  the outer Lagrangian factored by hand, CPU µs asdex / structured / Scaly: race_cars N=500 Hessian
+  253 / 55 / 49 and Jacobian 205 / 40 / 41; npmpc N=200 Hessian 200 / 174 / 249; unbumpercars 8
+  Hessian 245 / 61 / 575; chain_jac M=17 1665 / 183 / 401. The chain Hessian at M=9 and 17 stays at
+  asdex's speed, 2-3× slower than Scaly. Automatic extraction worked only on small whole programs.
+- [ ] J1. `aotax.sparse`: `sparse_hessian` (lower triangle) and `sparse_jacobian` of one selected
+  float argument return a values function, rows, cols, shape and a report. `method="auto"` extracts
+  local structure and falls back to asdex, `"structured"` raises instead of falling back, `"asdex"`
+  is the baseline with direct lower-triangle recovery. asdex becomes an optional extra. Workloads
+  supply their plain JAX function; the benchmarks build both columns through `aotax.sparse`.
+- [ ] J2. Automatic extraction of independent local maps and sums from unchanged workload functions:
+  sound array-axis analysis, backward demand extraction of one local program, local JAX derivatives
+  and a static assembly. Accept on race_cars, npmpc and chain_jac.
+- [ ] J3. Bounded scalar local derivatives and nested neighborhoods; accept on the chain Hessian.
+- [ ] J4. Shared local maps that feed several factors (unbumpercars' per-car network).
+- [ ] J5. `scan`, where carry analysis proves local structure; nonlinear rollouts stay dense.
 - [x] K0. Selective scalarization spike (notes/scalarization.md). IREE cannot reproduce Scaly's
   scalarization: Scaly's gain comes from turning a whole local stage function into scalar code with
   shared subexpressions inside a stage loop, while asdex's graph reaches IREE as batched color and
@@ -133,5 +146,5 @@ new modules until their design is settled.
 - [ ] K2. Tiny-dispatch C emitter. Wait for J, then measure on its local stage functions, where a
   whole stage may fit the budget.
 
-I is independent. J and K start as spikes outside the repository; their implementations follow
-their design notes.
+I and K1 are independent. One agent does J1 then J2; J3 and J4 follow J2 and can run in parallel
+with separate file ownership; K2 follows J2.
