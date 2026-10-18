@@ -747,10 +747,10 @@ static void fpu_set(uint64_t state) {{ _mm_setcsr((uint32_t)state); }}
 static uint64_t fpu_get(void) {{ return 0; }}
 static void fpu_set(uint64_t state) {{ (void)state; }}
 #endif
+#define FPU_MODE(state) ({"(state) | FPU_MASK" if approximate else "(state) & ~FPU_MASK"})
 static uint64_t fpu_enter(void) {{
   uint64_t state = fpu_get();
-  uint64_t mode = {"state | FPU_MASK" if approximate else "state & ~FPU_MASK"};
-  if (state != mode) fpu_set(mode);
+  if (state != FPU_MODE(state)) fpu_set(FPU_MODE(state));
   return state;
 }}
-static void fpu_leave(uint64_t state) {{ fpu_set(state); }}"""
+static void fpu_leave(uint64_t state) {{ if (state != FPU_MODE(state)) fpu_set(state); }}"""

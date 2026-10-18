@@ -85,7 +85,7 @@ On the CPU, `{name}_create` allocates aligned storage for transients, loop-carri
 Constants are embedded as aligned static data; any constant preparation runs at creation. The host
 allocates no heap memory during calls; Accelerate may allocate internally.
 It preserves subnormal values by default. With `approximate_math=True`, it flushes them to zero
-as IREE does. Both modes restore the caller's floating-point mode afterward. Inputs bind directly
+as IREE and XLA's CPU backend do. Both modes restore the caller's floating-point mode afterward. Inputs bind directly
 to the caller's arrays when the HAL program never writes them. Outputs bind directly when the HAL program gives them
 a separate buffer. Results that share storage with inputs, constants, or
 other results need a copy.
@@ -114,8 +114,8 @@ has no option to disable them in 3.12, which is why the accurate path uses promo
 CPU `float64` `cbrt` uses libm in both modes because IREE cannot lower it.
 
 On Metal, the default runs elementary functions through host libm adapters, waiting for preceding
-GPU work and writing results into shared buffers. This adds synchronization and can make math-heavy
-GPU programs much slower. Opting in keeps these operations on the GPU with IREE's approximations.
+GPU work and writing results into shared buffers. This adds synchronization: npmpc Hessians run
+3 to 5 times slower than with opt-in, in single calls and in batches of 128. Opting in keeps these operations on the GPU with IREE's approximations.
 Both modes use `MTLMathModeSafe`; the default also selects `MTLMathFloatingPointFunctionsPrecise`,
 and opt-in selects `Fast`. These are separate options. Safe alone leaves native math functions at
 Fast and cannot repair polynomials already emitted by IREE. See Apple's
@@ -254,30 +254,10 @@ matrix products. There most of the gap is the derivative algorithm rather than t
 asdex's colored products do 4.5 to 11.5 times the arithmetic of Scaly's symbolic derivatives, and
 XLA running the same asdex functions is also 5 to 9 times slower than Scaly.
 
-With the new default, an interleaved comparison on the same machine, best of five fresh processes
-per mode with alternating order, gives the following CPU times. Every binary checks every sparse
-entry against its dense reference before timing. The opt-in gain is modest on npmpc and within
-noise on race cars. The standard benchmark harness keeps using the accurate default.
-
-| Workload | Horizon | Default µs | Opt-in µs | Opt-in speedup |
-|---|---:|---:|---:|---:|
-| npmpc | 12 | 16.72 | 16.32 | 1.024× |
-| npmpc | 50 | 61.32 | 58.10 | 1.056× |
-| npmpc | 200 | 209.23 | 200.88 | 1.042× |
-| npmpc_jac | 12 | 9.25 | 8.84 | 1.046× |
-| npmpc_jac | 50 | 34.52 | 32.58 | 1.059× |
-| npmpc_jac | 200 | 133.65 | 125.75 | 1.063× |
-| race_cars | 5 | 3.55 | 3.56 | 0.998× |
-| race_cars | 40 | 18.06 | 17.84 | 1.013× |
-| race_cars | 500 | 261.27 | 258.01 | 1.013× |
-| race_cars_jac | 5 | 2.33 | 2.35 | 0.995× |
-| race_cars_jac | 40 | 15.00 | 15.12 | 0.992× |
-| race_cars_jac | 500 | 208.75 | 208.33 | 1.002× |
-
-The accurate f32 path also has a measurable cost. For `sin(x)*x + 2` on 65,536 float32 elements
-in [-1, 1], `Library.load()` takes 103.6 µs by default and 28.7 µs with opt-in, a 3.62× speedup.
-These are the best of five fresh processes per mode, alternating order, with 500 warm calls per
-process; allocation and Python call overhead are included. Both modes pass the dense check.
+The accurate default costs little on these workloads. In an interleaved comparison, best of five
+fresh processes per mode, opt-in makes npmpc 2 to 6% faster and leaves race cars unchanged. On
+65,536 float32 elements, `sin(x)*x + 2` is 3.6 times faster with opt-in, because the default
+computes `sin` in float64.
 
 The complete programs run whole algorithms written in JAX with loops: a fourth-order Runge-Kutta
 rollout, a Newton solve with `while_loop` and LU factorizations, a Gauss-Newton fit with Cholesky
@@ -298,8 +278,9 @@ Newton loses at larger n because hundreds of small dispatches surround each fact
 generates on its development branch.
 
 With `approximate_math=True` on the GPU, `device="metal"` pays off only for batches: from about
-32 to 48 npmpc Hessians at horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and 6.3× at 128. A single call
-costs about 400 µs against 11 µs on the CPU. `notes/metal.md` has the measurements.
+32 to 48 npmpc Hessians at horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and
+6.3× at 128. A single call costs about 400 µs against 11 µs on the CPU. With the accurate default,
+the GPU beats the CPU at 128 Hessians by only 1.1× at horizon 12 and 2.2× at horizon 50. `notes/metal.md` has the measurements.
 
 The first version of aotax ran IREE's own runtime and took 30.7, 92.2 and 322.9 µs on the npmpc
 Hessian, reduced to 15.9, 58.3 and 200.9 µs with the approximations now made opt-in.

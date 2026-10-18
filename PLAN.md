@@ -115,28 +115,14 @@ new modules until their design is settled.
 
 ## Phase 3
 
-- [x] I. `compile(approximate_math=False)` defaults to libm-quality elementary functions. CPU f32
-  `sin`/`cos`/`exp`/`log`/`tanh` promote to f64; these five f64 operations remain in dispatches.
-  Other elementary functions use libm adapters. Preserve JAX's `erfc`/`exp2`/`log2`/`log10`
-  primitives before export so their arithmetic decompositions do not introduce rounding errors.
-  The broadcast-math barrier is unchanged. Default host execution preserves subnormals; opt-in
-  flushes them, and both restore the caller's mode. Opt-in retains aotax's f64 exp polynomial
-  and IREE's approximations, except f64 `cbrt`, which needs a libm fallback to compile.
-  Metal's default elementary functions run on the host through shared buffers and wait for GPU
-  completion. Both modes keep Safe transformations; native math selects Precise by default,
-  Fast with opt-in. Safe alone does not select precise functions or undo IREE's polynomials.
-  Sources: IREE v3.12.0 `Codegen/Common/MathTransform.cpp` and `Passes.td`, its pinned LLVM
-  `PolynomialApproximation.cpp`, `iree-compile --help-hidden`, generated LLVM IR/assembly and
-  undefined symbols, Apple's `MTLCompileOptions` documentation and Metal Shading Language
-  specification sections 6.5 and 8.4. No pass option disables the math expansions.
-  Dense sweeps for 24 functions across CPU f32/f64 pass a 4-ulp bound, with measured maxima of
-  2 ulp and no NaN, infinity or signed-zero mismatches. Opt-in f64 exp stays within 2 ulp after
-  flushing subnormal references; IREE's other approximations have no common full-range bound.
-  Validation: 218 tests pass, one known IREE overlap xfail; Ruff lint/format and bench-group ty
-  pass. Benchmarks use the accurate default; the final interleaved default/opt-in results are
-  recorded in README.md: npmpc gains 2.4-6.3%; race cars changes by -0.8% to +1.3%, within noise.
-  The 65,536-element f32 `sin(x)*x+2` probe takes 103.6/28.7 µs by default/opt-in, a 3.62× gain.
-  Raw measurements and compiler artifacts are in `build/math/`.
+- [x] I. `compile(approximate_math=False)` gives libm-quality elementary functions by default. CPU
+  keeps f64 `sin`/`cos`/`exp`/`log`/`tanh` in dispatches and promotes f32 ones to f64; other
+  functions call generated libm adapters, and JAX's `erfc`/`exp2`/`log2`/`log10` are preserved
+  before export. The default keeps subnormals; opt-in flushes them (as XLA's CPU backend does),
+  expands f64 `exp` and keeps IREE's approximations, which no 3.12 option disables. Dense sweeps
+  of 24 functions stay within 2 ulp. Opt-in is 2-6% faster on npmpc, equal on race cars, 3.6× on
+  an f32 `sin` probe. Shortcut: Metal's default runs elementary functions on the host after
+  waiting for the GPU, 3-5× slower on npmpc; accurate f32 GPU implementations would remove it.
 - [x] J0. Structured derivatives spike (notes/structured-derivatives.md). Prototypes differentiate
   small local programs with JAX and assemble only the needed entries into static coordinates. With
   the outer Lagrangian factored by hand, CPU µs asdex / structured / Scaly: race_cars N=500 Hessian
