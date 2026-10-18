@@ -122,8 +122,16 @@ new modules until their design is settled.
   (vmapped stages, sums of element functions over index windows, scans) and assembles sparse
   Jacobians and Hessians from small local derivatives, falling back to asdex. Design spike first,
   measured against asdex and Scaly on chain, race_cars, npmpc and unbumpercars.
-- [ ] K. Selective scalarization: Scaly emits scalar code for tiny arrays. Find how to make IREE (or
-  an aotax pre-pass) do the same, measured on chain, race_cars and npmpc at small sizes.
+- [x] K0. Selective scalarization spike (notes/scalarization.md). IREE cannot reproduce Scaly's
+  scalarization: Scaly's gain comes from turning a whole local stage function into scalar code with
+  shared subexpressions inside a stage loop, while asdex's graph reaches IREE as batched color and
+  stage arrays with small axes inside. No IREE option, fusion policy or StableHLO pre-pass helps
+  across the board. Two bounded mechanisms do: power-of-two small-dimension tiles (race_cars N=500
+  16% faster) and plain C for dispatches whose tensors all have at most 256 elements (race_cars N=5
+  26% faster). Neither changes chain or npmpc.
+- [ ] K1. Power-of-two tile rule through CPU lowering configurations; independent of J.
+- [ ] K2. Tiny-dispatch C emitter. Wait for J, then measure on its local stage functions, where a
+  whole stage may fit the budget.
 
 I is independent. J and K start as spikes outside the repository; their implementations follow
 their design notes.
