@@ -18,9 +18,9 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 
 ## F. Scaly's workloads
 
-- [ ] F0. Multi-workload harness: workloads discovered from `benchmarks/workloads/*.py`, a generic
-  C++ check and timing binary, `bench.py --workloads`; npmpc moved, npmpc_jac added. A cancelled
-  first attempt is saved in /tmp/aotax-F0-partial.patch.
+- [x] F0. Multi-workload harness (`benchmarks/README.md`): workloads discovered from
+  `benchmarks/workloads/*.py`, generic C++ check and timing, `bench.py --workloads`. npmpc_jac
+  added: 9.1 / 33.0 / 126.3 µs against Scaly's 9.7 / 40.9 / 165.5 (0.94× / 0.81× / 0.76×).
 - [ ] F1. One agent per problem adds its module(s) only: chain (+jac), race_cars (+jac),
   unbumpercars, npmpc_decoder (+jac). Parallel after F0.
 - [ ] F2. Sweep all workloads, profile the worst ratios, choose the next optimization round.
