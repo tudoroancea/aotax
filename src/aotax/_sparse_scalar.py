@@ -79,16 +79,12 @@ def differentiate(fn, specs, hessian, matrix, outputs):
 
     pattern = _asdex(fn, specs, 0, hessian)
     r, c = pattern.rows, pattern.cols
-    active = np.unique(np.r_[r, c]) if hessian else np.arange(width)
-
-    def reduced(x, *p):
-      return fn(x if len(active) == width else jnp.zeros(width, dtype=x.dtype).at[active].set(x), *p)
-
-    array_derivative = (jax.hessian if hessian else (jax.jacfwd if width <= outputs else jax.jacrev))(reduced)
-    rr, cc = (np.searchsorted(active, r), np.searchsorted(active, c)) if hessian else (r, c)
+    # A zero derivative column can still supply a runtime primal coefficient.
+    indices = np.arange(width)
+    array_derivative = (jax.hessian if hessian else (jax.jacfwd if width <= outputs else jax.jacrev))(fn)
 
     def values(x, *p):
-      return array_derivative(x[active], *p)[rr, cc]
+      return array_derivative(x[indices], *p)[r, c]
 
   else:
     sf = scalarize(fn, *specs)

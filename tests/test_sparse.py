@@ -339,3 +339,31 @@ def test_transformed_shared_and_moving_parameter_windows(hessian):
   products = [eq for eq in closed.jaxpr.eqns if eq.primitive.name == "dot_general"]
   assert products
   assert all(not any(eq.params["dimension_numbers"][1]) for eq in products)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_hessian_keeps_primal_values_with_zero_derivative_columns(custom, tmp_path):
+  @jax.custom_jvp
+  def rule_value(a, b):
+    return a * a + b
+
+  @rule_value.defjvp
+  def rule(primals, tangents):
+    a, b = primals
+    da, _db = tangents
+    return rule_value(a, b), da * a * b
+
+  def f(x, w):
+    z = x.reshape(7, 2)
+    y = rule_value(z[:, 0], z[:, 1]) if custom else z[:, 0] ** 2 * jax.lax.stop_gradient(z[:, 1])
+    return (jnp.stack([y, y], axis=1) @ w).sum()
+
+  args = np.linspace(-0.4, 0.6, 14), np.array([[0.7], [-0.2]])
+  result = sparse_hessian(f, *args, method="structured")
+  check_sparse(result, f, args, hessian=True)
+
+  if custom:
+    import aotax
+
+    native = aotax.compile(result.values, *args, out=tmp_path).load()
+    np.testing.assert_allclose(native(*args), result.values(*args), rtol=1e-11, atol=1e-11)
