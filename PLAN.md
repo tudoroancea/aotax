@@ -65,8 +65,11 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
   rollout, Newton, Gauss-Newton fit, chain QP interior point, batched Newton); only the rollout
   compiles today. Scaly's generated Newton is 0.5 µs against aotax's 2.0 µs: dispatch count
   dominates small control-flow programs.
-- [ ] H1a+b. Host calls for custom calls, and LAPACK getrf/potrf/trsm adapters (f32, f64) on
-  Accelerate, inside loops, with context-owned scratch.
+- [x] H1a+b. `src/aotax/custom_calls.py`: JAX's LAPACK getrf, potrf and trsm custom calls (f32,
+  f64, batched, inside loops) become synchronous calls into Accelerate with context scratch, so
+  unchanged `jnp.linalg.solve`, `cholesky` and `solve_triangular` compile. A solve takes 0.31 µs at
+  n=4 and 15.6 µs at n=64; the five H0 workloads run 2-4× faster than JAX called from Python.
+  Reviewed by Opus 5.5 (xhigh), fixes checked by Fable 5.1.
 - [ ] H1c. User FFI targets: explicit registry, C adapter convention, link options.
 - [ ] H2. The H0 workloads in the benchmark harness, against Scaly's generated solvers where an
   equivalent exists and against JAX's own XLA CPU execution.
@@ -76,28 +79,3 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
 Review, F0, G0 and H0 start together; F1 follows F0; G1 follows G0; H1 and H2 follow H0. The
 reviewer only reads. F agents own `benchmarks/`; G and H spikes work outside the repository or in
 new modules until their design is settled.
-
-## H1a and H1b implementation
-
-The decided design is in `notes/custom-calls.md`; the H0 prototypes are in `/tmp/aotax-h0`.
-Implementation follows `src/aotax/{__init__,host,blas,exp}.py` and `tests/test_compile.py`.
-H1c remains separate. This task leaves `benchmarks/` to the workload agents.
-
-- [x] Rewrite supported tensor custom calls, retain specialization metadata, generate Accelerate
-  adapters with context scratch, and share host allocation and loop slot selection.
-- [x] Test solves, factorizations, triangular options, batches, loops, ownership, numerical status,
-  rejected signatures and native linking; document the supported calls.
-- [x] Run the full checks and npmpc baseline, then measure the H0 solves and five smoke workloads.
-- [x] Get one cross-family review, fix findings, check the delta and commit.
-
-The host integration depends on the registry contract; tests and measurements follow integration.
-The independent workload agents can continue adding their modules throughout.
-
-Validation: 80 tests pass with one existing IREE overlap xfail; Ruff, formatting and ty pass.
-The npmpc benchmark checks pass at 16.4 / 59.6 / 202.5 microseconds. Final solve and smoke
-measurements are in `/tmp/aotax-h1/{solve,workload}_timings.json`.
-
-Review by Claude Opus 5.5, xhigh, at `713a52d`: changes needed. Fixed false input aliases,
-validated LAPACK layouts, and pinned empty-dimension rejection. Also shared adapter scratch
-and documented Accelerate's internal allocation. Claude Fable 5.1, low, checked only the delta
-through `2f9aa1b`: all findings and notes resolved. H1c remains open.
