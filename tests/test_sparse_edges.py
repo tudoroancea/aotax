@@ -141,3 +141,118 @@ def test_asdex_rejects_out_of_bounds_scatter(mode):
   for method in ("auto", "asdex"):
     with pytest.raises(ValueError, match="asdex.*scatter.*out.of.bounds"):
       sparse_hessian(f, np.array([0.4, 0.7]), method=method)
+
+
+@pytest.mark.parametrize("method", ["auto", "asdex"])
+@pytest.mark.parametrize("operation", ["gather", "scatter"])
+def test_nested_out_of_bounds_indices(method, operation):
+  pytest.importorskip("asdex")
+  indices = np.array([0, 5])
+
+  def indexed(x, ix):
+    y = x.at[ix].get(mode="clip") if operation == "gather" else jnp.zeros(3).at[ix].add(x[:2], mode="clip")
+    return jnp.sin(y).sum()
+
+  def local(x):
+    return indexed(x, indices)
+
+  compiled = jax.jit(indexed)
+
+  def repeated(x):
+    return compiled(x, np.array([0, 1])) + compiled(x, indices)
+
+  @jax.custom_jvp
+  def custom(x):
+    return local(x)
+
+  custom.defjvp(lambda primals, tangents: jax.jvp(local, primals, tangents))
+
+  @jax.custom_vjp
+  def reverse(x):
+    return local(x)
+
+  reverse.defvjp(lambda x: (local(x), x), lambda x, g: jax.vjp(local, x)[1](g))
+
+  def scan(x):
+    return jax.lax.scan(lambda c, _: (c + x.sum(), local(x)), 0.0, None, length=2)[1].sum()
+
+  def loop(x):
+    return jax.lax.while_loop(lambda s: s[0] < 2, lambda s: (s[0] + 1, s[1] + local(x)), (0, 0.0))[1]
+
+  @jax.custom_jvp
+  def rule_only(x):
+    return jnp.sin(x).sum()
+
+  rule_only.defjvp(lambda primals, tangents: (rule_only(*primals), jax.jvp(local, primals, tangents)[1]))
+  wrappers = [
+    scan,
+    custom,
+    reverse,
+    rule_only,
+    loop,
+    lambda x: jax.lax.cond(x[0] > 0, local, jnp.sum, x),
+    jax.jit(local),
+    jax.checkpoint(local),
+    repeated,
+  ]
+  x = np.array([0.4, 0.7, -0.2])
+  for f in wrappers:
+    try:
+      result = sparse_hessian(f, x, method=method)
+    except ValueError as error:
+      assert f"asdex: {operation}" in str(error) and "out-of-bounds" in str(error)
+    else:
+      assert method == "auto" and result.report.startswith("structured:")
+      check(f, (x,), hessian=True, method=method)
+
+
+@pytest.mark.parametrize("method", ["auto", "asdex"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_custom_jvp_while_jacobian_uses_forward_mode(method, nested):
+  pytest.importorskip("asdex")
+
+  @jax.custom_jvp
+  def custom(x):
+    return jnp.sin(x)
+
+  @custom.defjvp
+  def rule(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    return custom(x), 3 * x * dx
+
+  def f(x):
+    step = custom if nested else jnp.sin
+    y = jax.lax.while_loop(lambda s: s[0] < 2, lambda s: (s[0] + 1, step(s[1]) + x), (0, x))[1]
+    return (y if nested else y + custom(x)).sum()
+
+  result = check(f, (np.array([0.4, 0.7, -0.2]),), hessian=False, method=method)
+  assert "asdex fwd" in result.report
+
+  @jax.custom_vjp
+  def reverse(x):
+    return jnp.sin(x)
+
+  reverse.defvjp(lambda x: (jnp.sin(x), x), lambda x, g: (4 * x * g,))
+
+  def parameter_loop(x, p):
+    q = jax.lax.while_loop(lambda s: s[0] < 2, lambda s: (s[0] + 1, jnp.sin(s[1])), (0, p))[1]
+    return (reverse(x) + q).sum()
+
+  x, p = np.array([0.4, 0.7, -0.2]), np.array(0.2)
+  result = sparse_jacobian(parameter_loop, x, p, method=method)
+  got = np.zeros(result.shape)
+  got[result.rows, result.cols] = jax.jit(result.values)(x, p)
+  np.testing.assert_allclose(got, jax.jacrev(parameter_loop)(x, p).reshape(result.shape), atol=1e-11, rtol=1e-11)
+  assert "asdex rev" in result.report
+
+
+@pytest.mark.parametrize("method", ["auto", "asdex"])
+def test_parameter_only_cond_hessian(method):
+  pytest.importorskip("asdex")
+  f = lambda x, p: (x * x).sum() * jax.lax.cond(p > 0, jnp.sin, jnp.cos, p)
+  x = np.array([0.4, 0.7, -0.2])
+  result = check(f, (x, np.array(0.2)), hessian=True, method=method)
+  for p in (np.array(-0.3), np.array(0.0), np.array(0.8)):
+    got = np.zeros(result.shape)
+    got[result.rows, result.cols] = jax.jit(result.values)(x, p)
+    np.testing.assert_allclose(got, jax.hessian(f)(x, p), rtol=1e-11, atol=1e-11)

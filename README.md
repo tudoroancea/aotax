@@ -249,7 +249,8 @@ with the reason in the report. The asdex path rejects statically out-of-bounds g
 scatter indices because asdex 0.5.2 can omit entries for these operations. Structured
 extraction supports clipped and filled gathers; out-of-bounds `promise_in_bounds` gathers
 raise because they violate the indexing promise. Unsupported asdex operations raise a
-`ValueError` naming the operation. While-loop Jacobians use forward mode.
+`ValueError` naming the operation. Index checks also inspect nested control flow and custom
+derivative programs. While-loop Jacobians use forward mode when reverse mode is unavailable.
 Outputs that share nonlinear work are grouped before
 Jacobian differentiation. Hessians differentiate weighted local primal sums with forward
 mode over reverse mode, then add their overlapping lower triangles. Nonlinear functions of

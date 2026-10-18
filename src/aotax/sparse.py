@@ -1,7 +1,7 @@
 """Sparse JAX derivatives with static, row-major matrix coordinates."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
@@ -105,29 +105,52 @@ def _asdex(f, specs, argnums, hessian):
   operations = {eq.primitive.name for eq in _equations(closed)}
   custom = operations & {"custom_jvp_call", "custom_vjp_call"}
   _check_indices(closed, operations)
-  if hessian and operations & {"cond", "while"}:
-    raise ValueError(f"asdex: {min(operations & {'cond', 'while'})}: Hessian detection is unsupported")
+  forward = False
   try:
     if custom:
-      differentiated = jax.grad(f, argnums=argnums) if hessian else f
-      output = jax.eval_shape(differentiated, *specs)
+      output = specs[argnums] if hessian else jax.eval_shape(f, *specs)
 
-      def pullback(seed, *xs):
-        return jax.vjp(differentiated, *xs)[1](seed)[argnums].reshape(-1)
+      def product(seed, *xs):
+        def selected(x):
+          return f(*xs[:argnums], x, *xs[argnums + 1 :])
 
-      transposed = asdex.jacobian_sparsity(pullback, np.zeros(output.shape, output.dtype), *samples, argnums=0)
-      pattern = asdex.SparsityPattern(transposed.cols, transposed.rows, transposed.shape[::-1], tuple(specs), argnums)
+        differentiated = jax.grad(selected) if hessian else selected
+        if forward:
+          return jax.jvp(differentiated, (xs[argnums],), (seed,))[1].reshape(-1)
+        return jax.vjp(differentiated, xs[argnums])[1](seed)[0].reshape(-1)
+
+      seed = np.zeros(output.shape, output.dtype)
+      try:
+        derived = jax.make_jaxpr(product)(seed, *specs)
+      except ValueError as error:
+        if hessian or "Reverse-mode differentiation does not work" not in str(error):
+          raise
+        forward = True
+        seed = np.zeros(specs[argnums].shape, specs[argnums].dtype)
+        derived = jax.make_jaxpr(product)(seed, *specs)
+      _check_indices(derived, {eq.primitive.name for eq in _equations(derived)})
+      detected = asdex.jacobian_sparsity(product, seed, *samples, argnums=0)
+      r, c, shape = (detected.rows, detected.cols, detected.shape) if forward else (detected.cols, detected.rows, detected.shape[::-1])
+      pattern = asdex.SparsityPattern(r, c, shape, tuple(specs), argnums)
       if hessian:
         coloring = asdex.hessian_coloring_from_sparsity(pattern, symmetric=False)
       else:
-        coloring = asdex.jacobian_coloring_from_sparsity(pattern, mode="rev" if "custom_vjp_call" in custom else None)
+        mode = "fwd" if forward else ("rev" if "custom_vjp_call" in custom else None)
+        coloring = asdex.jacobian_coloring_from_sparsity(pattern, mode=mode)
     elif hessian:
       coloring = asdex.hessian_coloring(f, *samples, argnums=argnums)
     else:
       coloring = asdex.jacobian_coloring(f, *samples, argnums=argnums, mode="fwd" if "while" in operations else None)
   except NotImplementedError as error:
-    raise ValueError(f"asdex: unsupported derivative detection: {error}") from error
-  compressed = (asdex.compressed_hessian_from_coloring if hessian else asdex.compressed_jacobian_from_coloring)(f, coloring)
+    context = ", ".join(sorted(operations & {"cond", "while", "scan"}))
+    raise ValueError(f"asdex: {context + ': ' if context else ''}unsupported derivative detection: {error}") from error
+  except ValueError as error:
+    if "Reverse-mode differentiation does not work" in str(error):
+      raise ValueError("asdex: while: reverse-mode differentiation is unsupported for this derivative") from error
+    raise
+  pattern = coloring.sparsity
+  coloring = replace(coloring, sparsity=asdex.SparsityPattern(pattern.rows, pattern.cols, pattern.shape, (specs[argnums],), 0))
+  compress = asdex.compressed_hessian_from_coloring if hessian else asdex.compressed_jacobian_from_coloring
   rows, cols = np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
   keep = np.flatnonzero(rows >= cols) if hessian else np.arange(rows.size)
   keep = keep[np.lexsort((cols[keep], rows[keep]))]
@@ -135,37 +158,37 @@ def _asdex(f, specs, argnums, hessian):
   gather = np.asarray(coloring._gather_indices)[keep]
 
   def values(*xs):
-    if (hessian or coloring.mode == "fwd") and any(s.dtype != specs[argnums].dtype for s in specs):
+    def selected(x):
+      return f(*xs[:argnums], x, *xs[argnums + 1 :])
 
-      def selected(x):
-        return f(*xs[:argnums], x, *xs[argnums + 1 :])
-
-      _, hvp = jax.linearize(jax.grad(selected) if hessian else selected, xs[argnums])
-      data = jax.vmap(hvp)(coloring._device_seeds(specs[argnums].dtype))
-    else:
-      data = compressed(*xs)
-    return data[gather[:, 0], gather[:, 1]]
+    return compress(selected, coloring)(xs[argnums])[gather[:, 0], gather[:, 1]]
 
   report = f"asdex {coloring.mode}: {coloring.num_colors} colors, {keep.size} entries; direct {'lower-triangle' if hessian else 'Jacobian'} recovery"
   if custom:
-    report += "; JAX pullback structural detection preserves custom derivative rules"
+    report += f"; JAX {'tangent' if forward else 'pullback'} structural detection preserves custom derivative rules"
     if hessian:
       report += "; nonsymmetric coloring does not assume custom rules have symmetric second derivatives"
   return SparseDerivative(values, _indices(rows[keep]), _indices(cols[keep]), coloring.sparsity.shape, report)
 
 
-def _equations(value):
+def _jaxprs(value):
   stack = [value]
   while stack:
     item = stack.pop()
-    if isinstance(item, (tuple, list)):
+    if hasattr(item, "jaxpr") or hasattr(item, "eqns"):
+      yield item
+    elif isinstance(item, dict):
+      stack.extend(item.values())
+    elif isinstance(item, (tuple, list)):
       stack.extend(item)
-    elif hasattr(item, "eqns"):
-      for eq in item.eqns:
-        yield eq
-        stack.extend(eq.params.values())
-    elif hasattr(item, "jaxpr") and item.jaxpr is not item:
-      stack.append(item.jaxpr)
+
+
+def _equations(value):
+  pending = list(_jaxprs(value))
+  while pending:
+    for eq in pending.pop().jaxpr.eqns:
+      yield eq
+      pending.extend(_jaxprs(eq.params))
 
 
 def _check_indices(closed, operations):
@@ -173,32 +196,55 @@ def _check_indices(closed, operations):
     return
   from aotax._sparse import Graph, Unsupported
 
-  graph = Graph(closed, -1)
-  pending, seen = [graph.output], set()
+  pending: list[tuple[Any, list[Any]]] = [(closed, [])]
   while pending:
-    n = pending.pop()
-    if n in seen:
-      continue
-    seen.add(n)
-    pending.extend(n.ins)
-    if n.eq is None:
-      continue
-    name, p = n.eq.primitive.name, n.eq.params
-    if name != "gather" and not name.startswith("scatter"):
-      continue
-    try:
-      indices = graph.constant(n.ins[1])
-    except Unsupported:
-      continue
-    dims = p["dimension_numbers"]
-    if name == "gather":
-      axes, sizes = dims.start_index_map, p["slice_sizes"]
-    else:
-      axes = dims.scatter_dims_to_operand_dims
-      free = [d for d in range(len(n.shape)) if d not in (*dims.inserted_window_dims, *dims.operand_batching_dims)]
-      sizes = [1] * len(n.shape)
-      for d, u in zip(free, dims.update_window_dims):
-        sizes[d] = n.ins[2].shape[u]
-    bounds = np.array([n.ins[0].shape[d] - sizes[d] for d in axes])
-    if np.any(indices < 0) or np.any(indices > bounds):
-      raise ValueError(f"asdex: {name}: static out-of-bounds indices are unsupported by asdex 0.5.2 detection")
+    closed, known = pending.pop()
+    graph = Graph(closed, -1)
+    for n, value in zip(graph.inputs, known):
+      n.value = value
+    seen = set()
+    for n in graph.nodes:
+      key = id(n.eq), id(n.ins)
+      if n.eq is None or key in seen:
+        continue
+      seen.add(key)
+      name, p = n.eq.primitive.name, n.eq.params
+      for child in _jaxprs(p):
+        if name == "scan":
+          constants = list(p["ft_in"].update(n.ins).unpack()[0])
+          args = constants + [None] * (len(child.jaxpr.invars) - len(constants))
+        elif name == "while":
+          start = p["cond_nconsts"] if child is p["body_jaxpr"] else 0
+          count = p["body_nconsts"] if child is p["body_jaxpr"] else p["cond_nconsts"]
+          args = list(n.ins[start : start + count]) + [None] * (len(child.jaxpr.invars) - count)
+        elif name == "cond":
+          args = n.ins[1:]
+        elif name in {"jit", "pjit", "custom_jvp_call", "custom_vjp_call", "remat2"} or n.eq.primitive.call_primitive:
+          args = n.ins
+        else:
+          args = ()
+        values = []
+        for a in args:
+          try:
+            values.append(graph.constant(a) if a is not None else None)
+          except Unsupported:
+            values.append(None)
+        pending.append((child, values))
+      if name != "gather" and not name.startswith("scatter"):
+        continue
+      try:
+        indices = graph.constant(n.ins[1])
+      except Unsupported:
+        continue
+      dims = p["dimension_numbers"]
+      if name == "gather":
+        axes, sizes = dims.start_index_map, p["slice_sizes"]
+      else:
+        axes = dims.scatter_dims_to_operand_dims
+        free = [d for d in range(len(n.shape)) if d not in (*dims.inserted_window_dims, *dims.operand_batching_dims)]
+        sizes = [1] * len(n.shape)
+        for d, u in zip(free, dims.update_window_dims):
+          sizes[d] = n.ins[2].shape[u]
+      bounds = np.array([n.ins[0].shape[d] - sizes[d] for d in axes])
+      if np.any(indices < 0) or np.any(indices > bounds):
+        raise ValueError(f"asdex: {name}: static out-of-bounds indices are unsupported by asdex 0.5.2 detection")

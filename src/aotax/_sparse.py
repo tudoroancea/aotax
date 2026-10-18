@@ -135,6 +135,7 @@ class Graph:
   def __init__(self, closed, argnums):
     self.argnums = argnums
     self.routes = {}
+    self.nodes = []
     self.inputs = [
       Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, arg=i, dependent=i == argnums) for i, v in enumerate(closed.jaxpr.invars)
     ]
@@ -162,6 +163,7 @@ class Graph:
         outs = [
           Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, eq=e, ins=ins, output=i, dependent=dependent) for i, v in enumerate(e.outvars)
         ]
+      self.nodes.extend(outs)
       env.update(zip(e.outvars, outs))
     return [read(v) for v in closed.jaxpr.outvars]
 
@@ -729,7 +731,7 @@ def structured(f, specs, argnums, hessian):
     else:
       gather[:] = order[starts[positions, None] + np.arange(count)]
     buckets.append((positions, gather))
-  restore = np.argsort(np.concatenate([positions for positions, _ in buckets])) if buckets else np.zeros(0, int)
+  restore = None if padded else np.argsort(np.concatenate([positions for positions, _ in buckets]))
 
   def values(*xs):
     if not evaluators:
