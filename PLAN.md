@@ -67,6 +67,10 @@ Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tole
   validation; CPU remains 16.1 / 58.4 / 200.1 µs. Clear batch wins start at 48 for N=12 and 12 for
   N=50, reaching 4.47× / 6.34× at 128. notes/metal.md records the full table. The requested Fable
   5.1 high-effort review could not run because the Claude API rate limit was reached.
+- [x] G1c. Metal uses Safe math, with regression coverage for nonfinite values and signed zero.
+  Batch-128 latency rose by less than 1%. Documented IREE's f32 trig range limit; float64 promotion
+  fixes CPU accuracy but costs about 7× on an elementwise probe. notes/metal.md has measurements.
+  All checks pass, including 19 Metal tests with API validation; CPU is 16.4 / 58.3 / 211.1 µs.
 - [ ] G2. Add f32 GPU columns to the benchmark sweep and map where CPU or GPU wins.
 
 ## H. Beyond Hessians: control flow, solver loops, foreign calls

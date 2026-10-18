@@ -47,6 +47,21 @@ def test_elementwise_repeated_calls(tmp_path, metal):
     np.testing.assert_allclose(loaded(x), jax.jit(fn)(x), rtol=2e-5, atol=2e-5)
 
 
+def test_nonfinite_and_signed_zero(tmp_path, metal):
+  def fn(x, y):
+    flags = (jnp.isnan(x), jnp.isinf(x), x == y, x != y, x < y, x <= y, x > y, x >= y)
+    return tuple(flag.astype(jnp.int32) for flag in flags), (x / x, x / y, y / x, jnp.maximum(x, y), jnp.minimum(x, y))
+
+  x = np.array([np.nan, np.inf, -np.inf, 0.0, -0.0, 1.0, -1.0, 1.0, 0.0, -0.0], np.float32)
+  y = np.array([1.0, np.inf, np.inf, 1.0, 1.0, 0.0, -0.0, np.nan, -0.0, 0.0], np.float32)
+  loaded = check(fn, x, y, tmp_path=tmp_path)
+  for a, b in ((x, y), (y, x)):
+    got, want = loaded(a, b), jax.jit(fn)(a, b)
+    jax.tree.map(np.testing.assert_array_equal, got, want)
+    for g, w in zip(got[1][:3], want[1][:3], strict=True):
+      np.testing.assert_array_equal(np.signbit(g[~np.isnan(w)]), np.signbit(w[~np.isnan(w)]))
+
+
 def test_matmul_and_mlp(tmp_path, metal):
   rng = np.random.default_rng(17)
   x, a, b, c = [rng.normal(size=shape).astype(np.float32) * 0.1 for shape in [(19, 9), (9, 32), (32, 32), (32, 2)]]

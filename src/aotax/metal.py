@@ -197,6 +197,7 @@ class MetalHost(_Host):
           "{",
           "MTLCompileOptions* options = [MTLCompileOptions new];",
           f"options.languageVersion = (MTLLanguageVersion){p['version']};",
+          "options.mathMode = MTLMathModeSafe;",
           f"id<MTLLibrary> lib = [c->device newLibraryWithSource:@{json.dumps(p['source'])} options:options error:&error];",
           'if (!lib) return fail(error.localizedDescription.UTF8String ?: "compiling Metal source");',
           f"id<MTLFunction> fn = [lib newFunctionWithName:@{json.dumps(p['entry'])}];",

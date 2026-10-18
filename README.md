@@ -177,6 +177,7 @@ statistics in a vector avoids this compiler failure.
 
 - CPU code is compiled for the host CPU; there is no cross-compilation.
 - Shapes are static, and inputs and outputs are dense `float32`, `float64`, `int32` or `int64`.
+- IREE 3.12's float32 `sin`/`cos` on CPU and Metal lose range-reduction accuracy around `|x| = 1e3` (absolute error about `3e-5`, growing with magnitude).
 - Host dispatches run on one thread; Accelerate controls threading within BLAS calls. A context
   cannot be called concurrently; separate contexts can.
 - Metal requires a Metal 4 device and macOS 26 or later, and a macOS 26 or later SDK to build the

@@ -179,3 +179,51 @@ overlapping native HAL copies, but does not repair IREE's unsupported dispatch l
 
 The requested cross-family review was launched with Claude Fable 5.1 at high effort, but failed
 with "Claude API rate limit reached. Try again later." No review verdict or delta check exists.
+
+## G1c: math mode and trig range
+
+The runtime MSL compile now sets `options.mathMode = MTLMathModeSafe`. The default fast mode
+folded `isnan(x)` to false and `x / x` to one, even for NaN, infinity and zero. The regression
+test compares NaN, both infinities and signed zeros against JAX for division, `isnan`, `isinf`,
+all six comparisons, and `maximum`/`minimum` with NaN in either operand. Division checks include
+the signs of zero and infinity. [Safe](https://developer.apple.com/documentation/metal/mtlmathmode/safe)
+disables unsafe floating-point optimizations; Relaxed preserves infinities and NaNs but still
+permits unsafe arithmetic transformations. Safe's measured cost does not justify Relaxed.
+
+Fresh builds from `benchmarks/metal.py`, same M4 Max, 100 Metal calls per process and five fresh
+processes per mode/case, alternating default/Safe order each pass. Both builds check every
+output against JAX with the table's existing tolerance. Best wall times, including staging:
+
+| Case | CPU default / Safe µs | Metal default µs | Metal Safe µs | Safe/default |
+|---|---:|---:|---:|---:|
+| N=12 single | 11.65 / 11.63 | 542.2 | 432.9 | 0.80× |
+| N=12 batch 128 | 3037.0 / 3069.6 | 784.2 | 790.5 | 1.008× |
+| N=50 batch 128 | 10402.0 / 10502.4 | 1588.5 | 1599.0 | 1.007× |
+
+Single-evaluation timing varied from 432.9 to 783.8 µs, so its apparent gain is inconclusive.
+Batch costs rose by less than 1%; Safe still gives 3.88× and 6.57× the CPU throughput at batch
+128. The largest Metal absolute error was 3.66e-4 with Safe and 3.85e-4 with the default.
+Builds and raw rounds are in `build/metal-math-{fast,safe}` and `build/metal-math-results.json`.
+
+The large-input float32 trig failure predates Metal. IREE's
+[`MathTransformPass`](https://github.com/iree-org/iree/blob/2b05c5dbb2f2ecb27c0d3941e80ee8d2f16e890d/compiler/src/iree/compiler/Codegen/Common/MathTransform.cpp)
+uses MLIR's `SinAndCosApproximation` on CPU and Metal. Its float32 range reduction computes
+`k = floor(x * (2/pi))`, then `y = x - k * (pi/2)` with single float32 constants, before evaluating
+a polynomial and choosing the quadrant through an int32 conversion. It has no full-range
+reduction or large-input fallback, and no compiler option disables just this approximation.
+Safe mode does not repair it.
+
+A sweep of 10,000 random float32 inputs in each range `[-10**k, 10**k]`, k=0 through 10, gave
+identical CPU/Metal maximum absolute errors: 2.8e-6 at magnitude 100, 2.8e-5 at 1,000,
+2.8e-4 at 10,000, 0.028 at 1e6 and 1.97 at 1e8. At `x=1e10f`, sine is about 1.33e20 and cosine
+about -6.03e21. These are progressive errors, not a sharp supported-range boundary.
+Promoting the CPU trig operands to float64 and casting the results back avoids the approximation
+and stayed within 5.96e-8 of JAX across the sweep. An exploratory in-process timing of both
+functions on 110,000 small inputs rose from 95.8 to 662.3 µs, about 7×, so no general promotion
+was added to `math.py`. CPU callers needing large arguments can explicitly use float64 trig;
+Metal cannot. `README.md` and `AGENTS.md` record the float32 limit.
+
+Validation: 115 tests pass with one expected IREE overlap failure; all 19 Metal tests pass with
+`MTL_DEBUG_LAYER=1`. Ruff lint/format and ty pass. The requested single-process CPU npmpc run
+checks all outputs and measures 16.41 / 58.31 / 211.06 µs at N=12 / 50 / 200, against Scaly's
+15.31 / 62.83 / 260.93 µs. The N=200 ratio remains 0.81× despite higher absolute times.
