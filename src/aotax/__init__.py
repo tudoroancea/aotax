@@ -122,6 +122,11 @@ def compile(
   wrapped.__name__ = name
   checks = [jax.export.DisabledSafetyCheck.custom_call(target) for target in targets]
   exported = jax.export.export(jax.jit(wrapped), disabled_checks=checks)(*args)
+  for aval in (*exported.in_avals, *exported.out_avals):
+    if aval.dtype not in DTYPES:
+      raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
+    if device == "metal" and aval.dtype not in {np.dtype(np.float32), np.dtype(np.int32)}:
+      raise TypeError(f"{name}: Metal supports float32 and int32 only; got {aval.dtype}")
   if device == "metal":
     from aotax.metal import validate
 
@@ -129,11 +134,6 @@ def compile(
     validate(text)
   else:
     text, custom_calls = rewrite_custom_calls(expand_math(exported.mlir_module()), targets)
-  for aval in (*exported.in_avals, *exported.out_avals):
-    if aval.dtype not in DTYPES:
-      raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
-    if device == "metal" and aval.dtype not in {np.dtype(np.float32), np.dtype(np.int32)}:
-      raise TypeError(f"{name}: Metal supports float32 and int32 only; got {aval.dtype}")
   library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree, device)
 
   (work / "stablehlo.mlir").write_text(text)
