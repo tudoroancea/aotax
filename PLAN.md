@@ -45,11 +45,14 @@ custom calls on CPU, which IREE rejects. Foreign function interface (FFI) calls 
 `jax.ffi.ffi_call` are custom calls too. Supporting custom calls as calls from the generated host
 into C (LAPACK from Accelerate, or a user's solver) serves both the optimization loops and FFI.
 
-- [ ] H0. Design spike: survey `devrush` (roots, opt/ipm, export, bench) and pick representative
-  workloads (a Newton or implicit solve with `while_loop`, a `scan` rollout, a fixed-iteration
-  interior-point or SQP loop); design custom-call support (how a `stablehlo.custom_call` reaches
-  the HAL program as a host call, buffer passing, placement inside loops); write a design note.
-- [ ] H1. Custom calls: LAPACK solves and Cholesky, and user FFI targets.
+- [x] H0. Design spike: notes/custom-calls.md. Custom calls become private tensor `func.call`s,
+  which IREE keeps as HAL `util.call`s; the host calls C adapters. Five workloads prototyped (chain
+  rollout, Newton, Gauss-Newton fit, chain QP interior point, batched Newton); only the rollout
+  compiles today. Scaly's generated Newton is 0.5 µs against aotax's 2.0 µs: dispatch count
+  dominates small control-flow programs.
+- [ ] H1a+b. Host calls for custom calls, and LAPACK getrf/potrf/trsm adapters (f32, f64) on
+  Accelerate, inside loops, with context-owned scratch.
+- [ ] H1c. User FFI targets: explicit registry, C adapter convention, link options.
 - [ ] H2. The H0 workloads in the benchmark harness, against Scaly's generated solvers where an
   equivalent exists and against JAX's own XLA CPU execution.
 
