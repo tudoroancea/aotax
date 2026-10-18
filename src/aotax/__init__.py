@@ -17,6 +17,7 @@ from iree.compiler.tools import binaries
 from jax.core import ShapedArray
 
 from aotax.blas import contractions
+from aotax.custom_calls import rewrite_custom_calls
 from aotax.exp import expand_exp
 from aotax.host import binding_writes, host
 
@@ -100,7 +101,8 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
       raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
   library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree)
 
-  (work / "stablehlo.mlir").write_text(expand_exp(exported.mlir_module()))
+  text, custom_calls = rewrite_custom_calls(expand_exp(exported.mlir_module()))
+  (work / "stablehlo.mlir").write_text(text)
   sources = work / "sources"
   sources.mkdir(exist_ok=True)
   for path in sources.glob("*.mlir"):
@@ -123,7 +125,16 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
   queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
   blas = contractions(sources) if sys.platform == "darwin" else {}
   (work / "host.c").write_text(
-    host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas, binding_writes(sources), exported.module_kept_var_idx)
+    host(
+      library,
+      (work / "hal.mlir").read_text(),
+      queries,
+      _signature(library),
+      blas,
+      binding_writes(sources),
+      exported.module_kept_var_idx,
+      custom_calls,
+    )
   )
   cc = os.environ.get("CC", "cc")
   subprocess.run(

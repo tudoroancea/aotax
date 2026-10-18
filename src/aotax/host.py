@@ -63,7 +63,7 @@ def _data(attr) -> bytes:
 
 
 class _Host:
-  def __init__(self, lib: Any, module, queries: list[str], blas, writes, kept):
+  def __init__(self, lib: Any, module, queries: list[str], blas, writes, kept, custom_calls):
     self.lib = lib
     self.kept = kept
     self.queries = queries
@@ -75,6 +75,7 @@ class _Host:
     self.entries = {}
     self.globals = {}
     self.functions = []
+    self.custom_calls = {}
     for top in module.body.operations:
       op = top.operation
       if op.name == "util.global":
@@ -84,6 +85,15 @@ class _Host:
         self.globals[key] = f"g{len(self.globals)}"
         self.fields.append(f"{_type(op.attributes['type'].value)} {self.globals[key]};")
       elif op.name in {"util.initializer", "util.func"}:
+        if op.name == "util.func" and not op.regions[0].blocks:
+          symbol = op.attributes["sym_name"].value
+          if symbol not in custom_calls:
+            self.unsupported(op, f"unregistered external declaration {symbol}")
+          spec = custom_calls[symbol]
+          t = ir.FunctionType(op.attributes["function_type"].value)
+          spec.validate_hal(t.inputs, t.results)
+          self.custom_calls[symbol] = (spec, self.storage(spec.scratch) + "[0]" if spec.scratch else "NULL")
+          continue
         if op.name == "util.func" and op.attributes["sym_name"].value != "main":
           self.unsupported(op, "private functions require memoization to be disabled")
         self.functions.append(op)
@@ -245,6 +255,25 @@ class _Host:
           seen.add(s)
           todo.extend(s.operations[-1].operation.successors)
       return False
+
+    def allocate(o, result, size):
+      live = (
+        sorted((v for v in live_after[o] | uses[o] if str(v.type) in BUFFERS and v not in o.results), key=lambda v: names[v])
+        if cyclic(o.block)
+        else []
+      )
+      pool = self.storage(size, len(live) + 1)
+      if live:
+        emit("{")
+        emit("  size_t slot = 0;")
+        checks = [
+          f"((uintptr_t){names[v]} >= (uintptr_t){pool}[slot] && (uintptr_t){names[v]} < (uintptr_t){pool}[slot] + {max(1, size)})" for v in live
+        ]
+        emit(f"  while ({' || '.join(checks)}) ++slot;")
+        emit(f"{names[result]} = {pool}[slot];")
+        emit("}")
+      else:
+        emit(f"{names[result]} = {pool}[0];")
 
     direct = {}
     returned = {}
@@ -430,23 +459,11 @@ class _Host:
           assign(o, [f"c->entries[{self.entries[entry][0]}]"])
         elif n in {"hal.device.queue.alloca", "hal.allocator.allocate"}:
           size = const(o.operands[-1], o)
-          live = sorted((v for v in live_after[o] if str(v.type) in BUFFERS and v not in o.results), key=lambda v: names[v]) if cyclic(b) else []
           output = direct.get(o.results[0])
           if output is not None:
             assign(o, [f"outputs[{output}]"])
             continue
-          pool = self.storage(size, len(live) + 1)
-          if live:
-            emit("{")
-            emit("  size_t slot = 0;")
-            checks = [
-              f"((uintptr_t){names[v]} >= (uintptr_t){pool}[slot] && (uintptr_t){names[v]} < (uintptr_t){pool}[slot] + {max(1, size)})" for v in live
-            ]
-            emit(f"  while ({' || '.join(checks)}) ++slot;")
-            assign(o, [f"{pool}[slot]"])
-            emit("}")
-          else:
-            assign(o, [f"{pool}[0]"])
+          allocate(o, o.results[0], size)
         elif n == "hal.allocator.import":
           assign(o, ["1", f"{a[4]} + {a[5]}"])
         elif n == "hal.ex.file.from_memory":
@@ -478,6 +495,16 @@ class _Host:
           assign(o, ["0"])
         elif n == "util.status.check_ok":
           emit(f"if ({a[0]}) return fail({json.dumps(o.attributes['message'].value)});")
+        elif n == "util.call":
+          symbol = o.attributes["callee"].value
+          if symbol not in self.custom_calls:
+            self.unsupported(o, f"unregistered call {symbol}")
+          spec, scratch = self.custom_calls[symbol]
+          spec.validate_hal([v.type for v in o.operands], [v.type for v in o.results])
+          for result, tensor in zip(o.results, spec.results, strict=True):
+            allocate(o, result, tensor.size)
+          pointers = [*a, *(names[r] for r in o.results), scratch]
+          emit(f'if ({symbol}({", ".join(pointers)})) return fail("custom call {spec.target} failed");')
         elif n == "util.return":
           if main:
             for i, value in enumerate(a):
@@ -489,7 +516,7 @@ class _Host:
     return f"static int run{number}({self.lib.name}_context* c{parameters}) {{\n" + "\n".join(declarations + code) + "\n}\n"
 
 
-def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, kept) -> str:
+def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, kept, custom_calls) -> str:
   with ir.Context():
     module = ir.Module.parse(text)
     # CPU imports bind embedded memory directly; their allocation fallback is unreachable.
@@ -512,7 +539,7 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, 
       op.results[0].replace_all_uses_with(imported.results[0])
     if imports:
       passes.PassManager.parse("builtin.module(canonicalize)").run(module.operation)
-    h = _Host(lib, module, queries, blas, writes, kept)
+    h = _Host(lib, module, queries, blas, writes, kept, custom_calls)
     functions = [h.function(fn, i) for i, fn in enumerate(h.functions)]
   n = lib.name
   ins, outs = len(lib.in_avals), len(lib.out_avals)
@@ -553,7 +580,7 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas else ""}
+{"#define ACCELERATE_NEW_LAPACK\n#include <Accelerate/Accelerate.h>" if blas or custom_calls else ""}
 #include "{n}.h"
 
 {chr(10).join(f"extern const library_header** {q}(uint32_t, const environment*);" for q in queries)}
@@ -611,6 +638,7 @@ static int dispatch({n}_context* c, const executable* e, size_t ordinal, uint32_
         if (e->exports.functions[ordinal](&env, &state, &wg)) return fail("dispatch failed");
   return 0;
 }}
+{chr(10).join(spec.adapter(symbol) for symbol, (spec, _) in h.custom_calls.items())}
 {chr(10).join(functions)}
 int {n}_create({n}_context** context) {{
   if (!context) return fail("null context pointer");

@@ -76,3 +76,19 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
 Review, F0, G0 and H0 start together; F1 follows F0; G1 follows G0; H1 and H2 follow H0. The
 reviewer only reads. F agents own `benchmarks/`; G and H spikes work outside the repository or in
 new modules until their design is settled.
+
+## H1a and H1b implementation
+
+The decided design is in `notes/custom-calls.md`; the H0 prototypes are in `/tmp/aotax-h0`.
+Implementation follows `src/aotax/{__init__,host,blas,exp}.py` and `tests/test_compile.py`.
+H1c remains separate. This task leaves `benchmarks/` to the workload agents.
+
+- [x] Rewrite supported tensor custom calls, retain specialization metadata, generate Accelerate
+  adapters with context scratch, and share host allocation and loop slot selection.
+- [x] Test solves, factorizations, triangular options, batches, loops, ownership, numerical status,
+  rejected signatures and native linking; document the supported calls.
+- [ ] Run the full checks and npmpc baseline, then measure the H0 solves and five smoke workloads.
+- [ ] Get one cross-family review, fix findings, check the delta and commit.
+
+The host integration depends on the registry contract; tests and measurements follow integration.
+The independent workload agents can continue adding their modules throughout.

@@ -9,6 +9,7 @@
   `iree-base-compiler==3.12.0`. Bump the pin, `abi.h` and the version check together.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
 - `src/aotax/exp.py`: rewrites f64 `stablehlo.exponential` into a vectorizable polynomial.
+- `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
 - `benchmarks/`: the npmpc Lagrangian Hessian from Scaly, timed against Scaly's generated C.
 
 ## Checks
@@ -31,6 +32,9 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Input pointers bind directly when 64-byte aligned, not overlapping outputs, and never written
   by the HAL program; otherwise they are staged through context buffers. Overlapping outputs are staged too.
 - IREE 3.12's `slow_memcpy` dispatch mishandles overlapping self-slices in `dynamic_update_slice`.
+- Custom calls keep tensor results until HAL; exporting empty destination buffers can reorder reads before calls.
+  Registered adapters borrow inputs, return fresh context buffers, and keep LAPACK `info` as tensor data.
+- Loop result slots avoid live pointers and call operands, including operands that die at the call.
 
 ## Measuring
 

@@ -57,6 +57,14 @@ program with IREE's compiler bindings and generates C that calls the dispatches 
 and loops become C control flow; copies and fills run in order when their command buffer executes.
 The archive contains only the generated host and dispatch objects. There is no IREE runtime.
 
+Before IREE compilation, supported LAPACK custom calls become private tensor function calls.
+IREE preserves their inputs and results in the HAL program, where the generated host calls
+static C adapters. On macOS these use Accelerate for LU, Cholesky and triangular solves in
+`float32` and `float64`, including batches and calls inside loops. The adapters convert row-major
+matrices to LAPACK's column-major layout for factorization, preserve inputs, and keep results
+and scratch in the context. LAPACK status stays in the tensor program, so singular solves and
+invalid Cholesky factorizations retain JAX's handling of nonfinite results.
+
 On macOS, aotax also reads IREE's dispatch sources from the same compilation. Pure matrix products
 call the Basic Linear Algebra Subprograms (BLAS) in Apple's Accelerate framework when they need
 at least 32,768 floating-point operations per matrix for `float64`, or 65,536 for `float32`.
@@ -99,6 +107,11 @@ Four compiler settings matter:
   cannot be called concurrently; separate contexts can.
 - The translator follows the pinned IREE compiler's executable application binary interface (ABI).
   Unsupported HAL operations or command-buffer patterns raise an error during compilation.
+- Custom calls support JAX's CPU `lapack_{s,d}getrf_ffi`, `lapack_{s,d}potrf_ffi` and
+  `lapack_{s,d}trsm_ffi` targets on macOS. These cover ordinary `jnp.linalg.solve`, Cholesky,
+  triangular solves and SciPy-style LU and Cholesky solves. Other targets, user foreign calls,
+  and LAPACK calls on other platforms raise an error during compilation. Adapters require static,
+  nonzero matrix and batch dimensions; JAX may eliminate empty calls before export.
 - Tested on macOS on Apple silicon. The Linux archive/link path is present but untested.
 
 ## Benchmarks
