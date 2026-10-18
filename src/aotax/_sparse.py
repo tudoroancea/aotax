@@ -800,8 +800,14 @@ def compose(graph, specs, source, hessian):
     ex = Extract(graph, 1)
     independent_fn, _, independent_params = ex.finish([ex.demand(source, independent[None, :])], False, primal=True)
 
+  def take(x, ids):
+    flat = ids.reshape(-1)
+    if len(flat) and np.array_equal(flat, np.arange(flat[0], flat[0] + len(flat))):
+      return x.reshape(-1)[int(flat[0]) : int(flat[-1]) + 1].reshape(ids.shape)
+    return x.reshape(-1)[ids]
+
   def primal(*xs):
-    return independent_fn(jnp.zeros(0, specs[argnums].dtype), *[xs[arg].reshape(-1)[ids[0]] for arg, ids in independent_params])
+    return independent_fn(jnp.zeros(0, specs[argnums].dtype), *[take(xs[arg], ids[0]) for arg, ids in independent_params])
 
   lifted_specs = list(specs)
   lifted_specs[argnums] = jax.ShapeDtypeStruct((width + len(active),), specs[argnums].dtype)
@@ -828,6 +834,20 @@ def compose(graph, specs, source, hessian):
     local_specs.extend(jax.ShapeDtypeStruct((ids.shape[1],), lifted_specs[arg].dtype) for arg, ids in ps)
     closed = jax.make_jaxpr(fn)(*local_specs)
     matrix = any(e.primitive.name == "dot_general" and any(len(getattr(v.aval, "shape", ())) >= 2 for v in e.invars) for e in closed.jaxpr.eqns)
+    if not hessian:
+      try:
+        distinct, inverse = unique(rows)
+      except Split:
+        pass
+      else:
+        if distinct.shape[1] < rows.shape[1]:
+          positions = [np.flatnonzero(inverse == i) for i in range(distinct.shape[1])]
+
+          def grouped(x, *p, fn=fn, positions=positions):
+            y = fn(x, *p)
+            return jnp.stack([y[ix].sum() for ix in positions])
+
+          fn, rows = grouped, distinct
     refined.append((fn, rows, ix, ps, matrix))
   pieces = refined
   outer = local_derivatives(pieces, shape, lifted_specs, argnums, hessian, full=hessian)
@@ -866,9 +886,9 @@ def compose(graph, specs, source, hessian):
         axes: list[int | None] = [0]
         for arg, ids in params:
           shared = np.all(ids == ids[:1])
-          ps.append(xs[arg].reshape(-1)[ids[0] if shared else ids])
+          ps.append(take(xs[arg], ids[0] if shared else ids))
           axes.append(None if shared else 0)
-        x = xs[argnums].reshape(-1)[inputs]
+        x = take(xs[argnums], inputs)
         if hessian:
           h, (y, j) = jax.vmap(second, in_axes=tuple(axes))(x, *ps)
           h = h[:, :, r, c].reshape(-1)
