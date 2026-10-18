@@ -57,15 +57,15 @@ def test_scalar_replay_preserves_constant_weak_type(weak):
 
 
 @pytest.mark.parametrize("hessian", [False, True])
-@pytest.mark.parametrize("mode", ["fill", "clip", "promise_in_bounds"])
-@pytest.mark.parametrize("fill", [0.0, 2.0, -3.0])
-def test_gather_out_of_bounds_routing(hessian, mode, fill):
-  f = lambda x: jnp.sin(x.at[np.array([0, 5, -8])].get(mode=mode, fill_value=fill)).sum()
-  if mode == "promise_in_bounds":
-    with pytest.raises(ValueError, match="gather.*out.of.bounds.*promise"):
-      (sparse_hessian if hessian else sparse_jacobian)(f, np.array([0.4, 0.7, -0.2]), method="structured")
-  else:
-    check(f, (np.array([0.4, 0.7, -0.2]),), hessian=hessian)
+def test_gather_out_of_bounds_routing(hessian):
+  for mode in ("fill", "clip", "promise_in_bounds"):
+    for fill in (0.0, 2.0, -3.0):
+      f = lambda x, mode=mode, fill=fill: jnp.sin(x.at[np.array([0, 5, -8])].get(mode=mode, fill_value=fill)).sum()
+      if mode == "promise_in_bounds":
+        with pytest.raises(ValueError, match="gather.*out.of.bounds.*promise"):
+          (sparse_hessian if hessian else sparse_jacobian)(f, np.array([0.4, 0.7, -0.2]), method="structured")
+      else:
+        check(f, (np.array([0.4, 0.7, -0.2]),), hessian=hessian)
 
 
 @pytest.mark.parametrize("mode", ["clip", "fill", "promise_in_bounds"])

@@ -107,27 +107,26 @@ def _asdex(f, specs, argnums, hessian):
   _check_indices(closed, operations)
   if hessian and operations & {"cond", "while"}:
     raise ValueError(f"asdex: {min(operations & {'cond', 'while'})}: Hessian detection is unsupported")
-  if custom:
-    differentiated = jax.grad(f, argnums=argnums) if hessian else f
-    output = jax.eval_shape(differentiated, *specs)
+  try:
+    if custom:
+      differentiated = jax.grad(f, argnums=argnums) if hessian else f
+      output = jax.eval_shape(differentiated, *specs)
 
-    def pullback(seed, *xs):
-      return jax.vjp(differentiated, *xs)[1](seed)[argnums].reshape(-1)
+      def pullback(seed, *xs):
+        return jax.vjp(differentiated, *xs)[1](seed)[argnums].reshape(-1)
 
-    transposed = asdex.jacobian_sparsity(pullback, np.zeros(output.shape, output.dtype), *samples, argnums=0)
-    pattern = asdex.SparsityPattern(transposed.cols, transposed.rows, transposed.shape[::-1], tuple(specs), argnums)
-    if hessian:
-      coloring = asdex.hessian_coloring_from_sparsity(pattern, symmetric=False)
-    else:
-      coloring = asdex.jacobian_coloring_from_sparsity(pattern, mode="rev" if "custom_vjp_call" in custom else None)
-  else:
-    try:
+      transposed = asdex.jacobian_sparsity(pullback, np.zeros(output.shape, output.dtype), *samples, argnums=0)
+      pattern = asdex.SparsityPattern(transposed.cols, transposed.rows, transposed.shape[::-1], tuple(specs), argnums)
       if hessian:
-        coloring = asdex.hessian_coloring(f, *samples, argnums=argnums)
+        coloring = asdex.hessian_coloring_from_sparsity(pattern, symmetric=False)
       else:
-        coloring = asdex.jacobian_coloring(f, *samples, argnums=argnums, mode="fwd" if "while" in operations else None)
-    except NotImplementedError as error:
-      raise ValueError(f"asdex: unsupported derivative detection: {error}") from error
+        coloring = asdex.jacobian_coloring_from_sparsity(pattern, mode="rev" if "custom_vjp_call" in custom else None)
+    elif hessian:
+      coloring = asdex.hessian_coloring(f, *samples, argnums=argnums)
+    else:
+      coloring = asdex.jacobian_coloring(f, *samples, argnums=argnums, mode="fwd" if "while" in operations else None)
+  except NotImplementedError as error:
+    raise ValueError(f"asdex: unsupported derivative detection: {error}") from error
   compressed = (asdex.compressed_hessian_from_coloring if hessian else asdex.compressed_jacobian_from_coloring)(f, coloring)
   rows, cols = np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
   keep = np.flatnonzero(rows >= cols) if hessian else np.arange(rows.size)
