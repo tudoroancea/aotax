@@ -123,6 +123,9 @@ new modules until their design is settled.
   of 24 functions stay within 2 ulp. Opt-in is 2-6% faster on npmpc, equal on race cars, 3.6× on
   an f32 `sin` probe. Shortcut: Metal's default runs elementary functions on the host after
   waiting for the GPU, 3-5× slower on npmpc; accurate f32 GPU implementations would remove it.
+  Reviewed by gpt-6.1-sol (xhigh): stale constants on recompiling, float16/complex intermediates,
+  floating-point mode left changed by foreign code, and reserved target and symbol names; all
+  fixed with regression tests and confirmed by gpt-6.1-sol (high).
 - [x] J0. Structured derivatives spike (notes/structured-derivatives.md). Prototypes differentiate
   small local programs with JAX and assemble only the needed entries into static coordinates. With
   the outer Lagrangian factored by hand, CPU µs asdex / structured / Scaly: race_cars N=500 Hessian
