@@ -262,3 +262,63 @@ def test_batched_contraction():
   args = np.linspace(-0.8, 0.9, 24), np.linspace(-0.5, 0.8, 16).reshape(2, 4, 2)
   result = sparse_hessian(f, *args, method="structured")
   check_sparse(result, f, args, hessian=True)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+def test_shared_primal_outputs_are_grouped(hessian):
+  def f(x, p, lam):
+    x = x.reshape(13, 3)
+    h = jnp.sin(x[:, 0] * x[:, 1] + x[:, 2])
+    y = jnp.stack([h * h, jnp.exp(h)], axis=1) * p
+    return (lam * y).sum() if hessian else y
+
+  args = np.linspace(-0.5, 0.6, 39), np.array([0.2, -0.3]), np.zeros((13, 2))
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, method="structured")
+  maps = [line for line in result.report.splitlines() if "local maps" in line]
+  assert len(maps) == 1
+  assert "13 local maps, width 3, 2 outputs/terms" in maps[0]
+  assert ("hessian" if hessian else "jacrev") in maps[0]
+  check_sparse(result, f, (*args[:2], np.linspace(-1, 1, 26).reshape(13, 2)), hessian=hessian)
+
+
+def test_forward_mode_and_shared_matrix_parameters():
+  def f(x, w):
+    h = jnp.sin(x.reshape(17, 2) @ w)
+    return jnp.stack([h[:, 0], h[:, 1], h[:, 0] * h[:, 1]], axis=1)
+
+  args = np.linspace(-0.5, 0.5, 34), np.linspace(-0.3, 0.4, 4).reshape(2, 2)
+  result = sparse_jacobian(f, *args, method="structured")
+  check_sparse(result, f, args, hessian=False)
+  assert "17 local maps, width 2, 3 outputs/terms" in result.report
+  assert "jacfwd" in result.report
+  closed = jax.make_jaxpr(result.values)(*args)
+  products = [eq for eq in closed.jaxpr.eqns if eq.primitive.name == "dot_general"]
+  assert products
+  assert all(not any(eq.params["dimension_numbers"][1]) for eq in products)
+  assert all(any(getattr(v.aval, "shape", None) == (2, 2) for v in eq.invars) for eq in products)
+
+
+def test_singleton_array_dot_and_reduced_jacobian():
+  x = np.linspace(-0.6, 0.7, 6).reshape(3, 2)
+  p = np.array([0.4, 0.8])
+  for f in [lambda x, p: jnp.sin(x[:1] @ p), lambda x, p: jnp.sin(x * p).sum(axis=0)]:
+    result = sparse_jacobian(f, x, p, method="structured")
+    check_sparse(result, f, (x, p), hessian=False)
+
+
+def test_wide_scalar_hessian_uses_construction_budget():
+  pytest.importorskip("asdex")
+
+  def f(x):
+    h = x.reshape(3, 12)
+    for _ in range(12):
+      h = jnp.sin(h + 0.1 * jnp.roll(h, 1, axis=1))
+    return h.sum()
+
+  x = np.linspace(-0.3, 0.4, 36)
+  with pytest.raises(ValueError, match="local Hessian width.*nested sparse"):
+    sparse_hessian(f, x, method="structured")
+  result = sparse_hessian(f, x)
+  assert "fallback:" in result.report
+  assert "local Hessian width" in result.report
+  check_sparse(result, f, (x,), hessian=True)
