@@ -52,5 +52,6 @@ plain JAX stage derivatives when whole-problem differentiation is too expensive.
 
 The npmpc workloads retain the original trained 32-wide decoder, horizon samples and
 mixed-sign constraint multipliers. Its objective multiplier is fixed to one. They use
-synthetic samples rather than Scaly's optional harvested closed-loop inputs. Decoder
-width sweeps are not included.
+synthetic samples rather than Scaly's optional harvested closed-loop inputs. The
+npmpc_decoder workloads instead sweep the decoder's width at horizon 12, with Scaly's
+seed-0 untrained weights.
