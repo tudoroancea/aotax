@@ -14,7 +14,14 @@ The `scaly` column uses Scaly's symbolic compiler. `aotax` uses `aotax.sparse` w
 `method="asdex"`; `aotax_structured` uses `method="auto"`. Each aotax library has a
 `sparse-report.txt` with its extraction/fallback report and Python construction time.
 Reports name the local derivative method, repetition counts, input widths and index maps, or
-the operation that required fallback. Construction time excludes compilation and native timing.
+the operation that required fallback. Local Hessians come from weighted primal sums;
+Jacobian outputs sharing nonlinear work use one local program per instance. Shared matrix
+parameters remain unbatched. Small non-matrix programs use scalar leaves; local Jacobians
+choose forward mode when input width is at most output count, and reverse mode otherwise.
+The static selection budget is 128 inputs and 512 array operations per local program.
+Non-matrix Hessians exceeding both width 8 and 128 operations use asdex pending nested
+sparse differentiation. There is no runtime tuning or workload-specific selection.
+Construction time excludes compilation and native timing.
 Results use the best CPU time across interleaved fresh processes. Generated files live
 in `build/<workload>/N<size>/<backend>/`; `build/results.csv` includes every repetition.
 

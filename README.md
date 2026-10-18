@@ -242,14 +242,23 @@ in row-major order. The frozen result contains `values`, immutable sorted unique
 The contract covers finite derivatives and aotax's documented floating-point behavior.
 
 `method="asdex"` uses structural detection and coloring with direct sparse recovery.
-`method="auto"` uses proved local structure and otherwise falls back to asdex, with the reason
-in the report. It extracts output neighborhoods, or gradient neighborhoods for Hessians, and
-differentiates the local array programs with JAX. Static gathers preserve overlapping and repeated
-input coordinates; contractions retain their matrix operations. Pointwise custom Jacobian-vector
-product (JVP) rules are preserved. `method="structured"` raises when extraction is unsupported.
-Large local graphs,
-shared nonlinear maps selected by gathers, general control flow and non-pointwise custom rules
-currently fall back.
+`method="auto"` extracts local programs from the primal function and otherwise uses asdex,
+with the reason in the report. Outputs that share nonlinear work are grouped before
+Jacobian differentiation. Hessians differentiate weighted local primal sums with forward
+mode over reverse mode, then add their overlapping lower triangles. Nonlinear functions of
+sums remain intact. Duplicate input coordinates are deduplicated before differentiation.
+
+Small programs without matrix products use scalar input leaves to remove absent tangents.
+Jacobians use forward mode when the local input width is at most the output count, and
+reverse mode otherwise. Matrix products retain their contractions; shared parameters use
+`vmap` with `in_axes=None`. Pointwise custom Jacobian-vector product (JVP) rules are preserved.
+`method="structured"` raises when extraction exceeds its supported rules or construction budget.
+
+Selection uses graph properties, without timing kernels: local programs have at most 128
+selected inputs and 512 array operations. Non-matrix Hessians exceeding both width 8 and
+128 operations use asdex because scalar second derivatives grow too large. Wide Jacobian
+neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
+maps selected by gathers, general control flow and non-pointwise custom rules also fall back.
 
 ## Benchmarks
 
