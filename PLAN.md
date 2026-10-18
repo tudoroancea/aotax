@@ -21,8 +21,21 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 - [x] F0. Multi-workload harness (`benchmarks/README.md`): workloads discovered from
   `benchmarks/workloads/*.py`, generic C++ check and timing, `bench.py --workloads`. npmpc_jac
   added: 9.1 / 33.0 / 126.3 µs against Scaly's 9.7 / 40.9 / 165.5 (0.94× / 0.81× / 0.76×).
-- [ ] F1. One agent per problem adds its module(s) only: chain (+jac), race_cars (+jac),
-  unbumpercars, npmpc_decoder (+jac). Parallel after F0.
+- [x] F1. Ported chain, race_cars, unbumpercars and npmpc_decoder (Hessian and Jacobian each),
+  cross-checked against Scaly's formulations. aotax / Scaly CPU time, from each port's own
+  interleaved run:
+
+  | Workload | sizes | Hessian | Jacobian |
+  |---|---|---|---|
+  | npmpc | N = 12, 50, 200 | 1.06×, 0.94×, 0.81× | 0.94×, 0.81×, 0.76× |
+  | npmpc_decoder | width 16, 64, 256 | 1.68×, 0.47×, 0.18× | 1.05×, 0.58×, 0.20× |
+  | unbumpercars | 2, 4, 8 cars | 0.31×, 0.31×, 0.42× | 0.62×, 0.35×, 0.40× |
+  | chain | M = 3, 9, 17 | 3.83×, 3.09×, 1.99× | 16.5×, 5.78×, 4.23× |
+  | race_cars | N = 5, 40, 500 | 5.40×, 4.56×, 5.24× | 5.85×, 5.48×, 5.68× |
+
+  aotax wins where neural networks dominate (Accelerate, vectorized code) and loses 2-16× on small
+  dense dynamics without matrix products, where time spreads over elementwise and transpose
+  dispatches, copies, fills and scalar `sin`/`cos`/`tanh` calls.
 - [ ] F2. Sweep all workloads, profile the worst ratios, choose the next optimization round.
 
 ## G. Metal GPU path
