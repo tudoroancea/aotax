@@ -57,6 +57,15 @@ program with IREE's compiler bindings and generates C that calls the dispatches 
 and loops become C control flow; copies and fills run in order when their command buffer executes.
 The archive contains only the generated host and dispatch objects. There is no IREE runtime.
 
+`aotax.compile(..., device="metal")` uses the same HAL analysis and control-flow translation to
+generate an Objective-C host for Metal 4. It embeds IREE's Metal Shading Language (MSL) source and
+compiles cached pipelines at `create`, without Xcode's optional Metal compiler. Each context owns
+shared buffers, an argument table per dispatch site, a residency set, and a reusable queue and
+command-buffer object. Dispatches, copies and fills use one compute encoder per queue execution.
+HAL barriers preserve dependencies; fences and host reads block on a shared event. Inputs and
+outputs always use staging copies. The generated header lists `-framework Metal -framework Foundation`,
+and `Library.load()` works as on the CPU.
+
 Before IREE compilation, supported LAPACK custom calls become private tensor function calls.
 IREE preserves their inputs and results in the HAL program, where the generated host calls
 static C adapters. On macOS these use Accelerate for LU, Cholesky and triangular solves in
@@ -72,7 +81,7 @@ The host passes their buffer offsets, strides and transpose flags directly; batc
 over BLAS calls. Smaller products, fused operations and layouts the translator cannot map exactly
 keep IREE's dispatch code. Other platforms use IREE for all dispatches.
 
-`{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
+On the CPU, `{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
 Constants are embedded as aligned static data; any constant preparation runs at creation. The host
 allocates no heap memory during calls; Accelerate may allocate internally.
 It flushes subnormal values to zero during execution, as IREE does,
@@ -166,10 +175,16 @@ statistics in a vector avoids this compiler failure.
 
 ## Limits
 
-- Code is compiled for the host CPU; there is no cross-compilation.
+- CPU code is compiled for the host CPU; there is no cross-compilation.
 - Shapes are static, and inputs and outputs are dense `float32`, `float64`, `int32` or `int64`.
 - Host dispatches run on one thread; Accelerate controls threading within BLAS calls. A context
   cannot be called concurrently; separate contexts can.
+- Metal requires a Metal 4 device and macOS 26 or later, and a macOS 26 or later SDK to build the
+  host. Inputs and outputs must be `float32` or `int32`. Float64 intermediates raise an error;
+  IREE's internal integer indices keep their original width. Metal does not use Accelerate or
+  support custom calls. Host control flow is preserved, but each loop iteration that submits work
+  pays GPU submission and completion latency. Single small evaluations are much slower than the
+  CPU; batching can amortize that cost. See [Metal measurements](notes/metal.md).
 - The translator follows the pinned IREE compiler's executable application binary interface (ABI).
   Unsupported HAL operations or command-buffer patterns raise an error during compilation.
 - Custom calls support JAX's CPU `lapack_{s,d}getrf_ffi`, `lapack_{s,d}potrf_ffi` and

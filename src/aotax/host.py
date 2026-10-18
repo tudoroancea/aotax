@@ -63,6 +63,14 @@ def _data(attr) -> bytes:
 
 
 class _Host:
+  device = "local*"
+  format = "static"
+  buffer_type = "unsigned char*"
+
+  @staticmethod
+  def type(t):
+    return _type(t)
+
   def __init__(self, lib: Any, module, queries: list[str], blas, writes, kept, custom_calls):
     self.lib = lib
     self.kept = kept
@@ -85,7 +93,7 @@ class _Host:
           self.unsupported(op, "initialized globals")
         key = op.attributes["sym_name"].value
         self.globals[key] = f"g{len(self.globals)}"
-        self.fields.append(f"{_type(op.attributes['type'].value)} {self.globals[key]};")
+        self.fields.append(f"{self.type(op.attributes['type'].value)} {self.globals[key]};")
       elif op.name in {"util.initializer", "util.func"}:
         if op.name == "util.func" and not op.regions[0].blocks:
           symbol = op.attributes["sym_name"].value
@@ -103,7 +111,7 @@ class _Host:
         for child in op.regions[0].blocks[0].operations:
           if child.operation.name == "hal.executable_end":
             continue
-          if child.operation.name != "hal.executable.binary" or child.attributes["format"].value != "static":
+          if child.operation.name != "hal.executable.binary" or child.attributes["format"].value != self.format:
             self.unsupported(child.operation)
       else:
         self.unsupported(op)
@@ -117,6 +125,73 @@ class _Host:
     self.fields.append(f"alignas(64) unsigned char {name}[{count}][{max(64, (size + 63) // 64 * 64)}];")
     return f"c->{name}"
 
+  def add(self, buffer, offset):
+    return f"({buffer} + {offset})"
+
+  def read(self, buffer):
+    return buffer
+
+  def occupied(self, value, slot, size):
+    return f"((uintptr_t){value} >= (uintptr_t){slot} && (uintptr_t){value} < (uintptr_t){slot} + {max(1, size)})"
+
+  def constant(self, data):
+    symbol = f"data{len(self.data)}"
+    self.data.append(f"alignas(64) static const unsigned char {symbol}[] = {{{','.join(map(str, data)) or '0'}}};")
+    return f"(unsigned char*){symbol}"
+
+  def executable(self, target):
+    query = target + "_library_query"
+    if query not in self.queries:
+      raise ValueError(f"aotax: no library query for {query}")
+    return f"c->libraries[{self.queries.index(query)}]"
+
+  def entry(self, path):
+    entry = path[-1]
+    if entry not in self.entries:
+      self.entries[entry] = (len(self.entries), path[0] + "_library_query")
+    return f"c->entries[{self.entries[entry][0]}]"
+
+  def copy(self, target, source, length):
+    return f"memmove({target}, {source}, {length});"
+
+  def fill(self, target, length, pattern, width):
+    return f"fill({target}, {length}, {pattern}, sizeof({width}));"
+
+  def wait(self):
+    return ""
+
+  def begin(self):
+    return ""
+
+  def end(self):
+    return ""
+
+  def barrier(self):
+    return ""
+
+  def dispatch(self, executable, ordinal, entry, groups, pointers, lengths, constants, emit):
+    x, y, z = groups
+    emit("{")
+    emit(f"  void* ptrs[] = {{{', '.join(pointers)}}};")
+    emit(f"  const size_t lengths[] = {{{', '.join(lengths)}}};")
+    emit(f"  const uint32_t constants[] = {{{', '.join(constants) or '0'}}};")
+    contraction = self.blas.get(entry)
+    fallback = f"if (dispatch(c, {executable}, {ordinal}, {x}, {y}, {z}, constants, ptrs, lengths)) return 1;"
+    if contraction is not None:
+      guard, lines = contraction.emit()
+      for view in (contraction.a, contraction.b):
+        if view.data:
+          emit(f"  alignas(64) static const unsigned char {view.binding}[] = {{{','.join(map(str, view.data))}}};")
+      emit(f"  if ({x} && {y} && {z}) {{")
+      emit(f"    if ({guard}) {{")
+      for line in lines:
+        emit("      " + line)
+      emit(f"    }} else {fallback}")
+      emit("  }")
+    else:
+      emit("  " + fallback)
+    emit("}")
+
   def function(self, fn, number):
     main = fn.name == "util.func"
     blocks = list(fn.regions[0].blocks)
@@ -126,7 +201,7 @@ class _Host:
     for b in blocks:
       for v in [*b.arguments, *(v for o in b.operations for v in o.results)]:
         names[v] = f"v{len(names)}"
-        declarations.append(f"  {_type(v.type)} {names[v]} = 0;")
+        declarations.append(f"  {self.type(v.type)} {names[v]} = {{0}};")
 
     def val(v):
       return constants.get(v, names[v])
@@ -147,7 +222,8 @@ class _Host:
       return None
 
     def emit(s):
-      code.append("  " + s)
+      if s:
+        code.append("  " + s)
 
     def assign(o, values):
       for r, value in zip(o.results, values, strict=True):
@@ -204,7 +280,7 @@ class _Host:
             self.unsupported(o, "command recording must follow creation in the same block")
           if o.name == "hal.command_buffer.finalize":
             active[cmd] = (active[cmd][0], True)
-          elif o.name != "hal.command_buffer.execution_barrier":
+          else:
             active[cmd][0].append(o)
         elif o.name in {"hal.device.queue.execute", "hal.device.queue.execute.indirect"}:
           cmd = o.operands[4]
@@ -268,9 +344,7 @@ class _Host:
       if live:
         emit("{")
         emit("  size_t slot = 0;")
-        checks = [
-          f"((uintptr_t){names[v]} >= (uintptr_t){pool}[slot] && (uintptr_t){names[v]} < (uintptr_t){pool}[slot] + {max(1, size)})" for v in live
-        ]
+        checks = [self.occupied(names[v], f"{pool}[slot]", size) for v in live]
         emit(f"  while ({' || '.join(checks)}) ++slot;")
         emit(f"{names[result]} = {pool}[slot];")
         emit("}")
@@ -279,7 +353,7 @@ class _Host:
 
     direct = {}
     returned = {}
-    if main:
+    if main and self.format == "static":
       returns = [o for o in ops if o.name == "util.return"]
       if len(returns) == 1:
         for i, v in enumerate(returns[0].operands):
@@ -305,10 +379,10 @@ class _Host:
         buf, base, _ = table[index]
         if write:
           written(buf)
-        return f"({val(buf)} + {val(base)} + {val(offset)})"
+        return self.add(val(buf), f"{val(base)} + {val(offset)}")
       if write:
         written(v)
-      return f"({val(v)} + {val(offset)})"
+      return self.add(val(v), val(offset))
 
     def dispatch(o, table):
       g = segments(o)
@@ -321,42 +395,25 @@ class _Host:
       if entry not in self.writes:
         self.unsupported(o, f"missing binding layout for {entry}")
       pointers = [binding(v, off, table, write) for v, off, write in zip(g[7], g[8], self.writes[entry], strict=True)]
-      emit("{")
-      emit(f"  void* ptrs[] = {{{', '.join(pointers)}}};")
-      emit(f"  const size_t lengths[] = {{{', '.join(val(v) for v in g[9])}}};")
-      emit(f"  const uint32_t constants[] = {{{', '.join(val(v) for v in g[6]) or '0'}}};")
-      contraction = self.blas.get(entry)
-      fallback = f"if (dispatch(c, {executable}, {ordinal}, {x}, {y}, {z}, constants, ptrs, lengths)) return 1;"
-      if contraction is not None:
-        guard, lines = contraction.emit()
-        for view in (contraction.a, contraction.b):
-          if view.data:
-            emit(f"  alignas(64) static const unsigned char {view.binding}[] = {{{','.join(map(str, view.data))}}};")
-        emit(f"  if ({x} && {y} && {z}) {{")
-        emit(f"    if ({guard}) {{")
-        for line in lines:
-          emit("      " + line)
-        emit(f"    }} else {fallback}")
-        emit("  }")
-      else:
-        emit("  " + fallback)
-      emit("}")
+      self.dispatch(executable, ordinal, entry, (x, y, z), pointers, [val(v) for v in g[9]], [val(v) for v in g[6]], emit)
 
     def command(o, table):
       a = list(o.operands)
       if o.name == "hal.command_buffer.dispatch":
         dispatch(o, table)
       elif o.name == "hal.command_buffer.copy_buffer":
-        emit(f"memmove({binding(a[3], a[4], table, True)}, {binding(a[1], a[2], table)}, {val(a[5])});")
+        emit(self.copy(binding(a[3], a[4], table, True), binding(a[1], a[2], table), val(a[5])))
       elif o.name == "hal.command_buffer.fill_buffer":
-        emit(f"fill({binding(a[1], a[2], table, True)}, {val(a[3])}, {val(a[4])}, sizeof({_type(a[4].type)}));")
+        emit(self.fill(binding(a[1], a[2], table, True), val(a[3]), val(a[4]), self.type(a[4].type)))
+      elif o.name == "hal.command_buffer.execution_barrier":
+        emit(self.barrier())
       else:
         self.unsupported(o)
 
     def branch(b, args):
       emit("{")
       for i, v in enumerate(args):
-        emit(f"  {_type(v.type)} t{i} = {val(v)};")
+        emit(f"  {self.type(v.type)} t{i} = {val(v)};")
       for i, v in enumerate(b.arguments):
         emit(f"  {names[v]} = t{i};")
       emit(f"  goto b{blocks.index(b)};")
@@ -372,7 +429,7 @@ class _Host:
         a = [val(v) for v in o.operands]
         n = o.name
         if n == "arith.constant":
-          constants[o.results[0]] = f"(({_type(o.results[0].type)}){int(o.attributes['value'].value)})"
+          constants[o.results[0]] = f"(({self.type(o.results[0].type)}){int(o.attributes['value'].value)})"
         elif n in {
           "arith.addi",
           "arith.subi",
@@ -403,9 +460,9 @@ class _Host:
           left, right = [signed(v) for v in o.operands] if n.endswith("si") else a
           assign(o, [f"{left} {'<' if '.min' in n else '>'} {right} ? {a[0]} : {a[1]}"])
         elif n in {"arith.index_cast", "arith.extsi"}:
-          assign(o, [f"({_type(o.results[0].type)})({signed(o.operands[0])})"])
+          assign(o, [f"({self.type(o.results[0].type)})({signed(o.operands[0])})"])
         elif n in {"arith.index_castui", "arith.extui", "arith.trunci"}:
-          assign(o, [f"({_type(o.results[0].type)}){a[0]}"])
+          assign(o, [f"({self.type(o.results[0].type)}){a[0]}"])
         elif n in {"arith.cmpi", "util.cmp.eq"}:
           pred = int(o.attributes["predicate"].value) if n == "arith.cmpi" else 0
           operator = ["==", "!=", "<", "<=", ">", ">=", "<", "<=", ">", ">="][pred]
@@ -423,16 +480,14 @@ class _Host:
           branch(o.successors[1], g[2])
           emit("}")
         elif n == "util.null":
-          assign(o, ["0"])
+          assign(o, [f"({self.type(o.results[0].type)}){{0}}"])
         elif n == "util.global.load":
           assign(o, [f"c->{self.globals[o.attributes['global'].value]}"])
         elif n == "util.global.store":
           emit(f"c->{self.globals[o.attributes['global'].value]} = {a[0]};")
         elif n == "util.buffer.constant":
           data = _data(o.attributes["value"])
-          symbol = f"data{len(self.data)}"
-          self.data.append(f"alignas(64) static const unsigned char {symbol}[] = {{{','.join(map(str, data)) or '0'}}};")
-          assign(o, [f"(unsigned char*){symbol}"])
+          assign(o, [self.constant(data)])
         elif n == "hal.devices.count" or n in {
           "hal.devices.get",
           "hal.device.allocator",
@@ -446,19 +501,13 @@ class _Host:
           assign(o, ["1"])
         elif n == "hal.device.query":
           category, key = o.attributes["category"].value, o.attributes["key"].value
-          if (category, key) not in {("hal.device.id", "local*"), ("hal.executable.format", "static")}:
+          if (category, key) not in {("hal.device.id", self.device), ("hal.executable.format", self.format)}:
             self.unsupported(o, f"device query {category}/{key}")
           assign(o, ["1", "1"])
         elif n == "hal.executable.create":
-          target = o.attributes["executable_target"].value[0] + "_library_query"
-          if target not in self.queries:
-            self.unsupported(o, f"no library query for {target}")
-          assign(o, [f"c->libraries[{self.queries.index(target)}]"])
+          assign(o, [self.executable(o.attributes["executable_target"].value[0])])
         elif n == "hal.executable.lookup.function":
-          entry = o.attributes["entry_point"].value[-1]
-          if entry not in self.entries:
-            self.entries[entry] = (len(self.entries), o.attributes["entry_point"].value[0] + "_library_query")
-          assign(o, [f"c->entries[{self.entries[entry][0]}]"])
+          constants[o.results[0]] = self.entry(o.attributes["entry_point"].value)
         elif n in {"hal.device.queue.alloca", "hal.allocator.allocate"}:
           size = const(o.operands[-1], o)
           output = direct.get(o.results[0])
@@ -467,21 +516,27 @@ class _Host:
             continue
           allocate(o, o.results[0], size)
         elif n == "hal.allocator.import":
-          assign(o, ["1", f"{a[4]} + {a[5]}"])
+          assign(o, ["1", self.add(a[4], a[5])])
         elif n == "hal.ex.file.from_memory":
-          assign(o, [f"{a[2]} + {a[3]}"])
+          assign(o, [self.add(a[2], a[3])])
         elif n in {"hal.device.queue.read", "hal.device.queue.copy"}:
           written(o.operands[6])
-          emit(f"memmove({a[6]} + {a[7]}, {a[4]} + {a[5]}, {a[8]});")
+          emit(self.begin())
+          emit(self.copy(self.add(a[6], a[7]), self.add(a[4], a[5]), a[8]))
+          emit(self.end())
         elif n == "hal.device.queue.fill":
           written(o.operands[4])
-          emit(f"fill({a[4]} + {a[5]}, {a[6]}, {a[7]}, sizeof({_type(o.operands[7].type)}));")
+          emit(self.begin())
+          emit(self.fill(self.add(a[4], a[5]), a[6], a[7], self.type(o.operands[7].type)))
+          emit(self.end())
         elif n in {"hal.buffer_view.buffer", "util.optimization_barrier"}:
           assign(o, a)
         elif n in {"hal.buffer_view.create", "hal.buffer.subspan"}:
-          assign(o, [f"{a[0]} + {a[1]}"])
+          assign(o, [self.add(a[0], a[1])])
         elif n == "hal.buffer.load":
-          emit(f"memcpy(&{names[o.results[0]]}, {a[0]} + {a[1]}, sizeof({names[o.results[0]]}));")
+          emit(self.wait())
+          source = self.add(a[0], a[1])
+          emit(f"memcpy(&{names[o.results[0]]}, {self.read(source)}, sizeof({names[o.results[0]]}));")
         elif n in {"hal.device.queue.execute", "hal.device.queue.execute.indirect"}:
           count = (len(o.operands) - 5) // 3
           table = (
@@ -489,11 +544,14 @@ class _Host:
             if n.endswith(".indirect")
             else None
           )
+          emit(self.begin())
           for recorded in commands[o]:
             command(recorded, table)
+          emit(self.end())
         elif n.startswith("hal.command_buffer.") or n in {"hal.buffer.assert", "hal.buffer_view.assert", "hal.device.queue.dealloca"}:
           pass
         elif n == "hal.fence.await":
+          emit(self.wait())
           assign(o, ["0"])
         elif n == "util.status.check_ok":
           emit(f"if ({a[0]}) return fail({json.dumps(o.attributes['message'].value)});")
@@ -514,14 +572,16 @@ class _Host:
           emit("return 0;")
         else:
           self.unsupported(o)
-    parameters = ", unsigned char** inputs, unsigned char** outputs, unsigned char** results" if main else ""
+    parameters = f", {self.buffer_type}* inputs, {self.buffer_type}* outputs, {self.buffer_type}* results" if main else ""
     return f"static int run{number}({self.lib.name}_context* c{parameters}) {{\n" + "\n".join(declarations + code) + "\n}\n"
 
 
-def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, kept, custom_calls) -> str:
+def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, kept, custom_calls, device="cpu") -> str:
+  from aotax.metal import MetalHost
+
   with ir.Context():
     module = ir.Module.parse(text)
-    # CPU imports bind embedded memory directly; their allocation fallback is unreachable.
+    # Embedded constants import directly; their allocation fallback is unreachable.
     imports = [
       o.operation
       for top in module.body.operations
@@ -541,8 +601,13 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, 
       op.results[0].replace_all_uses_with(imported.results[0])
     if imports:
       passes.PassManager.parse("builtin.module(canonicalize)").run(module.operation)
-    h = _Host(lib, module, queries, blas, writes, kept, custom_calls)
+    if device == "metal":
+      h = MetalHost(lib, module, queries, blas, writes, kept, custom_calls)
+    else:
+      h = _Host(lib, module, queries, blas, writes, kept, custom_calls)
     functions = [h.function(fn, i) for i, fn in enumerate(h.functions)]
+    if isinstance(h, MetalHost):
+      return h.render(functions, signature)
   n = lib.name
   ins, outs = len(lib.in_avals), len(lib.out_avals)
   stage_inputs = [h.storage(a.size * a.dtype.itemsize) for a in lib.in_avals]

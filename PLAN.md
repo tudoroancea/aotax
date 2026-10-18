@@ -84,6 +84,9 @@ Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tole
 - [ ] G1b. After H1a+b lands: `aotax.compile(..., device="metal")`, with the
   same C API, generated from the same HAL translation (dispatches encoded into one command buffer,
   barriers as memory barriers, transients as shared buffers).
+  - [x] Share HAL analysis and control flow; add Metal executable extraction and command emission.
+  - [x] Wire compilation and loading, then test control flow, staging and Metal API validation.
+  - [ ] Measure the production backend, update docs, run checks and cross-family review, commit.
 - [ ] G2. Add f32 GPU columns to the benchmark sweep and map where CPU or GPU wins.
 
 ## H. Beyond Hessians: control flow, solver loops, foreign calls

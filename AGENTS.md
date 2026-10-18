@@ -5,6 +5,7 @@
 - `src/aotax/__init__.py`: `compile` exports StableHLO with `jax.export`, runs `iree-compile` to
   the HAL phase, generates `host.c`, and archives it with IREE's dispatch object.
 - `src/aotax/host.py`: translates IREE's HAL program into a plain C host. No IREE runtime.
+- `src/aotax/metal.py`: Metal 4 device hooks for that translator and IREE 3.12's `MTL1` FlatBuffer schema; emits ARC Objective-C.
 - `src/aotax/abi.h`: IREE's executable library ABI v0 (library version 6), as of
   `iree-base-compiler==3.12.0`. Bump the pin, `abi.h` and the version check together.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
@@ -39,6 +40,14 @@ uv run --group bench benchmarks/bench.py --reps 5
 - User FFI targets require `compile(foreign=...)`; descriptors carry static tensors, `Foreign` requests context scratch, and `load(extra=...)` links implementations.
 - HAL buffer subspans are pointer offsets; optimization barriers are identities in the C host.
   Both retain their input buffers' aliases for liveness and input staging.
+- Metal uses buffer-plus-offset values with the same HAL analysis, liveness and control flow as CPU.
+  One reusable Metal 4 command buffer is re-encoded per queue execution; its allocator and argument
+  buffers are reused only after completion. One compute encoder preserves HAL barriers and orders
+  native copies/fills. Overlapping native copies use scratch; non-byte fills expand a seed with copies.
+- Metal stages all caller arrays through context-owned shared buffers. Fences and host reads wait on
+  a shared event and check commit feedback. Pipelines, argument tables and residency live in the context.
+  It requires macOS 26 and a Metal 4 device. It rejects float64 and custom calls, preserves internal
+  integer widths, and skips CPU BLAS routing and the f64 exp rewrite.
 
 ## Measuring
 

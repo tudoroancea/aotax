@@ -71,6 +71,11 @@ class Library:
   out_avals: tuple[ShapedArray, ...]
   in_tree: Any
   out_tree: Any
+  device: str = "cpu"
+
+  @property
+  def system_libs(self) -> tuple[str, ...]:
+    return ("-framework", "Metal", "-framework", "Foundation") if self.device == "metal" else SYSTEM_LIBS
 
   def load(self, *, extra: Sequence[str | Path] = ()) -> Callable[..., Any]:
     """Load as a Python function, linking `extra` objects, libraries or flags after the archive."""
@@ -78,13 +83,27 @@ class Library:
 
 
 def compile(
-  fn: Callable[..., Any], *args: Any, out: str | Path, name: str | None = None, foreign: Mapping[str, str | Foreign] | None = None
+  fn: Callable[..., Any],
+  *args: Any,
+  out: str | Path,
+  name: str | None = None,
+  foreign: Mapping[str, str | Foreign] | None = None,
+  device: str = "cpu",
 ) -> Library:
   """Compile `fn` at the shapes and dtypes of `args`, arrays or `jax.ShapeDtypeStruct`s, into `out`.
 
   `out` receives `{name}.h` and `lib{name}.a`, and `iree/` beneath it the intermediate files: the
   StableHLO, IREE's hardware abstraction layer (HAL) program, dispatch object and generated host.
   """
+  if device not in {"cpu", "metal"}:
+    raise ValueError(f"aotax: unsupported device {device!r}; use 'cpu' or 'metal'")
+  if device == "metal" and sys.platform != "darwin":
+    raise ValueError("aotax: Metal requires macOS 26 or later")
+  if device == "metal":
+    for leaf in jax.tree.leaves(args):
+      dtype = np.dtype(leaf.dtype) if hasattr(leaf, "dtype") else np.asarray(leaf).dtype
+      if dtype in {np.dtype(np.float64), np.dtype(np.int64)}:
+        raise TypeError(f"aotax: Metal supports float32 and int32 only; got {dtype}")
   name = name or getattr(fn, "__name__", "")
   if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
     raise ValueError(f"{name!r} is not a C identifier; pass name=")
@@ -103,11 +122,19 @@ def compile(
   wrapped.__name__ = name
   checks = [jax.export.DisabledSafetyCheck.custom_call(target) for target in targets]
   exported = jax.export.export(jax.jit(wrapped), disabled_checks=checks)(*args)
-  text, custom_calls = rewrite_custom_calls(expand_math(exported.mlir_module()), targets)
+  if device == "metal":
+    from aotax.metal import validate
+
+    text, custom_calls = exported.mlir_module(), {}
+    validate(text)
+  else:
+    text, custom_calls = rewrite_custom_calls(expand_math(exported.mlir_module()), targets)
   for aval in (*exported.in_avals, *exported.out_avals):
     if aval.dtype not in DTYPES:
       raise TypeError(f"{name}: dtype {aval.dtype} is not supported; use one of {', '.join(map(str, DTYPES))}")
-  library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree)
+    if device == "metal" and aval.dtype not in {np.dtype(np.float32), np.dtype(np.int32)}:
+      raise TypeError(f"{name}: Metal supports float32 and int32 only; got {aval.dtype}")
+  library = Library(name, out / f"{name}.h", out / f"lib{name}.a", exported.in_avals, exported.out_avals, exported.in_tree, exported.out_tree, device)
 
   (work / "stablehlo.mlir").write_text(text)
   sources = work / "sources"
@@ -116,13 +143,24 @@ def compile(
     path.unlink()
   for path in (work / "library.o", work / "library.h"):
     path.unlink(missing_ok=True)
+  flags = IREE_FLAGS
+  if device == "metal":
+    flags = (
+      "--iree-input-type=stablehlo",
+      "--iree-input-demote-f64-to-f32=false",
+      "--iree-input-demote-i64-to-i32=false",
+      "--iree-hal-target-device=metal",
+      "--iree-metal-compile-to-metallib=false",
+      "--compile-to=hal",
+      "--iree-hal-memoization=false",
+    )
   subprocess.run(
     [
       binaries.find_tool("iree-compile"),
       work / "stablehlo.mlir",
-      *IREE_FLAGS,
+      *flags,
       f"--iree-hal-dump-executable-sources-to={sources}",
-      f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}",
+      *([f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}"] if device == "cpu" else []),
       "-o",
       work / "hal.mlir",
     ],
@@ -139,8 +177,9 @@ def compile(
     declarations.append(f"// {spec.target!r}: {', '.join(tensors)}; scratch: {spec.scratch} bytes.\n{spec.foreign.declaration}")
   library.header.write_text(_header(library, "\n".join(declarations)))
   queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
-  blas = contractions(sources) if sys.platform == "darwin" else {}
-  (work / "host.c").write_text(
+  blas = contractions(sources) if sys.platform == "darwin" and device == "cpu" else {}
+  source = work / ("host.m" if device == "metal" else "host.c")
+  source.write_text(
     host(
       library,
       (work / "hal.mlir").read_text(),
@@ -150,6 +189,7 @@ def compile(
       binding_writes(sources),
       exported.module_kept_var_idx,
       custom_calls,
+      *([device] if device == "metal" else []),
     )
   )
   cc = os.environ.get("CC", "cc")
@@ -159,10 +199,11 @@ def compile(
       "-O2",
       "-fPIC",
       "-std=c11",
+      *(["-fobjc-arc", "-fblocks", "-mmacosx-version-min=13.0", "-Wno-unguarded-availability-new"] if device == "metal" else []),
       "-I",
       out,
       "-c",
-      work / "host.c",
+      source,
       "-o",
       work / "host.o",
     ],
@@ -204,12 +245,12 @@ def _header(lib: Library, foreign: str = "") -> str:
 {foreign}
 """
   return f"""\
-// {lib.name}, compiled from a JAX function by aotax. Link lib{lib.name}.a, then {" ".join(SYSTEM_LIBS)}.
+// {lib.name}, compiled from a JAX function by aotax. Link lib{lib.name}.a, then {" ".join(lib.system_libs)}.
 // Arrays are contiguous and row-major:
 {chr(10).join(shapes)}
 // create and call return 0 on success; on failure they print an error to stderr and return 1.
-// Pointers need no special alignment. Read-only bindings aligned to 64 bytes avoid staging copies.
-// Inputs are copied before execution if the compiled program writes their bindings.
+// Pointers need no special alignment. {"Metal stages all inputs and outputs through shared buffers." if lib.device == "metal" else "Read-only bindings aligned to 64 bytes avoid staging copies."}
+// {"Metal requires macOS 26 or later and compiles embedded MSL at create." if lib.device == "metal" else "Inputs are copied before execution if the compiled program writes their bindings."}
 // Inputs may alias outputs; outputs may overlap and are written in the order listed.
 // A context is not thread-safe, but separate contexts may be used concurrently.
 #pragma once
@@ -242,7 +283,7 @@ class _Loaded:
     keep = [f"-Wl,-u,{prefix}{lib.name}_{fn}" for fn in ("create", "call", "destroy")]
     with tempfile.NamedTemporaryFile(dir=lib.archive.parent, suffix=".dylib" if sys.platform == "darwin" else ".so") as shared:
       linked = subprocess.run(
-        [os.environ.get("CC", "cc"), "-shared", "-o", shared.name, *keep, lib.archive, *extra, *SYSTEM_LIBS],
+        [os.environ.get("CC", "cc"), "-shared", "-o", shared.name, *keep, lib.archive, *extra, *lib.system_libs],
         check=False,
         capture_output=True,
         text=True,
