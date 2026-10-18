@@ -1,7 +1,7 @@
 """Local primal programs and static assembly for sparse JAX derivatives."""
 
-from dataclasses import dataclass
-from functools import cached_property
+from dataclasses import dataclass, replace
+from functools import cache, cached_property
 
 import jax
 import jax.numpy as jnp
@@ -287,11 +287,6 @@ def routing(graph, n):
     out = np.full(n.shape, offsets[1], dtype=int)
     out[tuple(slice(lo, lo + sz * (interior + 1), interior + 1) for (lo, hi, interior), sz in zip(cfg, n.ins[0].shape))] = a[0]
   elif name == "gather":
-    source = n.ins[0]
-    while source.eq is not None and source.eq.primitive.name in ROUTING - {"gather"}:
-      source = source.ins[0]
-    if source.dependent and source.arg is None:
-      raise Unsupported("gather: selecting a shared computed map needs shared-map extraction")
     index = graph.constant(n.ins[1])
     with jax.ensure_compile_time_eval():
       out = np.asarray(n.eq.primitive.bind(a[0], index, **dict(p, fill_value=-1)))
@@ -376,7 +371,8 @@ class Extract:
       for a in n.ins:
         mapping = np.broadcast_to(np.arange(a.size).reshape(a.shape), n.shape).reshape(-1)
         inputs.append(self.demand(a, mapping[ids]))
-      fn = lambda *a: n.eq.primitive.bind(*a, **p)
+      primitive = n.eq.primitive
+      fn = lambda *a: primitive.bind(*a, **p)
       return self.op(fn, tuple(inputs), name)
     if name == "custom_jvp_call":
       f = Graph.custom(n.eq)
@@ -475,17 +471,19 @@ class Extract:
     ls = tuple(s for d, s in enumerate(lshape) if d not in remove_l)
     rs = tuple(s for d, s in enumerate(rshape) if d not in remove_r)
 
+    primitive = n.eq.primitive
+
     def fn(a, b):
-      result = n.eq.primitive.bind(a.reshape(ls), b.reshape(rs), **lp).reshape(-1)
+      result = primitive.bind(a.reshape(ls), b.reshape(rs), **lp).reshape(-1)
       return result if np.array_equal(pick, np.arange(int(np.prod(localdims)))) else result[pick]
 
     return self.op(fn, (li, ri), "dot_general")
 
-  def finish(self, outputs, hessian):
+  def finish(self, outputs, hessian, *, primal=False):
     selected = [ids for _, arg, ids in self.leaves if arg == self.graph.argnums]
-    if not selected:
+    if not selected and not primal:
       return None
-    inputs, _ = unique(np.concatenate(selected, axis=1))
+    inputs, _ = unique(np.concatenate(selected, axis=1)) if selected else (np.empty((self.count, 0), int), None)
     if inputs.shape[1] > 128:
       raise Unsupported(f"local input: width {inputs.shape[1]} exceeds 128; reduction/contraction mixes the candidate axis")
     if (
@@ -513,7 +511,7 @@ class Extract:
       leaf.update((i, x if np.array_equal(ix, np.arange(inputs.shape[1])) else x[ix]) for i, ix in lookups.items())
       for i, (op, args) in enumerate(self.ops):
         vals.append(leaf[i] if op is None else op(*(vals[j] for j in args)))
-      result = jnp.stack([vals[i][0] for i in outputs])
+      result = jnp.concatenate([vals[i] for i in outputs]) if primal else jnp.stack([vals[i][0] for i in outputs])
       return result.sum() if hessian else result
 
     return fn, inputs, params
@@ -578,10 +576,10 @@ def program(ex, term, indices):
   return value if sign == 1 else ex.op(lambda x: -x, (value,), "neg")
 
 
-def extract(f, specs, argnums, hessian):
-  graph = Graph(jax.make_jaxpr(f)(*specs), argnums)
-  roots = terms(graph)
+def extract(graph, specs, hessian, *, linear=True):
+  roots = terms(graph) if linear else [(graph.output, np.arange(graph.output.size), np.arange(graph.output.size), (), 1)]
   groups = []
+  neighborhoods = []
   pending = [(i, np.arange(len(term[1]))) for i, term in enumerate(roots)]
   while pending:
     i, indices = pending.pop()
@@ -596,6 +594,7 @@ def extract(f, specs, argnums, hessian):
       continue
     matrix = any(n.eq.primitive.name == "dot_general" and max(len(a.shape) for a in n.ins) >= 2 for n, _ in ex.anchors)
     groups.append((i, indices, ex.anchors if piece is not None and (piece[1].shape[1] <= 8 or matrix) else []))
+    neighborhoods.append(piece[1] if piece is not None and not linear else None)
 
   # Two demanded outputs share an instance when they demand the same nonlinear primal.
   offsets = np.r_[0, np.cumsum([len(indices) for _, indices, _ in groups])]
@@ -609,6 +608,14 @@ def extract(f, specs, argnums, hessian):
 
   owners = {}
   for g, (_, indices, anchors) in enumerate(groups):
+    neighborhood = neighborhoods[g]
+    if neighborhood is not None:
+      for k, inputs in enumerate(neighborhood):
+        key = ("inputs", tuple(inputs))
+        current = find(offsets[g] + k)
+        if key in owners:
+          parents[find(owners[key])] = current
+        owners[key] = current
     for node, ids in anchors:
       for k, demanded in enumerate(ids):
         current = find(offsets[g] + k)
@@ -657,7 +664,7 @@ def extract(f, specs, argnums, hessian):
             bool(any(n.eq.primitive.name == "dot_general" and max(len(a.shape) for a in n.ins) >= 2 for n, _ in ex.anchors)),
           )
         )
-  n = specs[argnums].size
+  n = specs[graph.argnums].size
   return pieces, (n if hessian else graph.output.size, n)
 
 
@@ -672,15 +679,50 @@ def input_map(ids):
 
 
 def structured(f, specs, argnums, hessian):
-  from aotax._sparse_scalar import differentiate
-  from aotax.sparse import SparseDerivative, _indices
+  graph = Graph(jax.make_jaxpr(f)(*specs), argnums)
 
-  pieces, shape = extract(f, specs, argnums, hessian)
+  @cache
+  def computed(n):
+    return n.dependent and n.eq is not None and (n.eq.primitive.name not in ROUTING or any(computed(a) for a in n.ins))
+
+  live, pending = set(), [graph.output]
+  while pending:
+    n = pending.pop()
+    if n not in live:
+      live.add(n)
+      pending.extend(n.ins)
+  sources = []
+  for n in graph.nodes:
+    if n in live and n.eq is not None and n.eq.primitive.name == "gather":
+      source = n.ins[0]
+      if computed(source) and source not in sources:
+        sources.append(source)
+  if sources:
+    if len(sources) != 1:
+      raise Unsupported("shared-map extraction: multiple computed gather sources")
+    return compose(graph, specs, sources[0], hessian)
+  try:
+    pieces, shape = extract(graph, specs, hessian)
+  except Unsupported:
+    slices = {}
+    for n in live:
+      if n.eq is not None and n.eq.primitive.name == "slice" and computed(n.ins[0]):
+        slices.setdefault(n.ins[0], []).append(routing(graph, n)[0])
+    sources = [n for n, reads in slices.items() if any(np.intersect1d(a, b).size for i, a in enumerate(reads) for b in reads[:i])]
+    if len(sources) == 1:
+      return compose(graph, specs, sources[0], hessian)
+    raise
+  return local_derivatives(pieces, shape, specs, argnums, hessian)
+
+
+def local_derivatives(pieces, shape, specs, argnums, hessian, full=False):
+  from aotax._sparse_scalar import differentiate
+
   evaluators, allrows, allcols, reports = [], [], [], []
   for fn, rows, inputs, params, matrix in pieces:
     local_specs = [jax.ShapeDtypeStruct((inputs.shape[1],), specs[argnums].dtype)]
     local_specs.extend(jax.ShapeDtypeStruct((ids.shape[1],), specs[arg].dtype) for arg, ids in params)
-    closed, r, c, mode = differentiate(fn, local_specs, hessian, matrix, rows.shape[1])
+    closed, r, c, mode = differentiate(fn, local_specs, hessian, matrix, rows.shape[1], full=full)
     if not len(r):
       continue
     allrows.append((inputs[:, r] if hessian else rows[:, r]).reshape(-1))
@@ -713,6 +755,193 @@ def structured(f, specs, argnums, hessian):
       f"{('input-independent hessian' if hessian else 'affine coefficients') if affine else mode}; parameters "
       + "; ".join(f"arg {arg}: {input_map(ids)}" for arg, ids in params)
     )
+  report = "structured: grouped primal " + ("sums; local hessian (forward over reverse)" if hessian else "outputs; local Jacobians")
+  reports.insert(
+    0,
+    "selection: at most 128 inputs, 512 array operations and backward-demand depth 128; non-matrix Hessians exceeding both width 8 and 128 operations use asdex",
+  )
+  return assemble(evaluators, allrows, allcols, shape, specs[argnums].dtype, "\n".join([report, *reports]))
+
+
+def compose(graph, specs, source, hessian):
+  argnums = graph.argnums
+  width = specs[argnums].size
+  if not np.issubdtype(source.dtype, np.floating):
+    raise Unsupported("shared map: outputs must be real floating arrays")
+  saved = replace(source)
+  source.arg, source.eq, source.ins = len(specs), None, ()
+  pending = [(term, np.arange(len(term[1]))) for term in terms(graph)]
+  needed = []
+  while pending:
+    term, indices = pending.pop()
+    ex = Extract(graph, len(indices))
+    try:
+      program(ex, term, indices)
+    except Split as split:
+      pending.extend((term, indices[split.labels == k]) for k in np.unique(split.labels))
+      if len(pending) > 256:
+        raise Unsupported("shared map: more than 256 distinct index programs")
+      continue
+    needed.extend(ids.reshape(-1) for _, arg, ids in ex.leaves if arg == len(specs))
+  source.__dict__.update(saved.__dict__)
+  if not needed:
+    pieces, shape = extract(graph, specs, hessian)
+    return local_derivatives(pieces, shape, specs, argnums, hessian)
+  needed = np.unique(np.concatenate(needed))
+  output = graph.output
+  spec = jax.ShapeDtypeStruct(source.shape, source.dtype)
+  graph.output = graph.build(jax.make_jaxpr(lambda x: x.reshape(-1)[needed])(spec), [source])[0]
+  maps, _ = extract(graph, specs, False, linear=False)
+  graph.output = output
+  active = np.unique(np.concatenate([needed[rows.reshape(-1)] for _, rows, _, _, _ in maps]))
+  independent = np.setdiff1d(needed, active)
+  independent_fn, independent_params = lambda x: x, []
+  if len(independent):
+    ex = Extract(graph, 1)
+    independent_fn, _, independent_params = ex.finish([ex.demand(source, independent[None, :])], False, primal=True)
+
+  def primal(*xs):
+    return independent_fn(jnp.zeros(0, specs[argnums].dtype), *[xs[arg].reshape(-1)[ids[0]] for arg, ids in independent_params])
+
+  lifted_specs = list(specs)
+  lifted_specs[argnums] = jax.ShapeDtypeStruct((width + len(active),), specs[argnums].dtype)
+  lifted_specs.append(spec)
+  selected = Node(lifted_specs[argnums].shape, specs[argnums].dtype, arg=argnums, dependent=True)
+  original = graph.inputs[argnums]
+  replacement = graph.build(jax.make_jaxpr(lambda x: x[:width].reshape(original.shape))(lifted_specs[argnums]), [selected])[0]
+  original.__dict__.update(replacement.__dict__)
+  passive = Node(source.shape, source.dtype, arg=len(specs))
+  inactive = np.setdiff1d(np.arange(source.size), active)
+  order = np.argsort(np.r_[active, inactive])
+  replacement = graph.build(
+    jax.make_jaxpr(lambda x, p: jnp.concatenate([x[width:].astype(spec.dtype), p.reshape(-1)[inactive]])[order].reshape(source.shape))(
+      lifted_specs[argnums], spec
+    ),
+    [selected, passive],
+  )[0]
+  source.__dict__.update(replacement.__dict__)
+  graph.routes.clear()
+  pieces, shape = extract(graph, lifted_specs, hessian)
+  refined = []
+  for fn, rows, ix, ps, _ in pieces:
+    local_specs = [jax.ShapeDtypeStruct((ix.shape[1],), specs[argnums].dtype)]
+    local_specs.extend(jax.ShapeDtypeStruct((ids.shape[1],), lifted_specs[arg].dtype) for arg, ids in ps)
+    closed = jax.make_jaxpr(fn)(*local_specs)
+    matrix = any(e.primitive.name == "dot_general" and any(len(getattr(v.aval, "shape", ())) >= 2 for v in e.invars) for e in closed.jaxpr.eqns)
+    refined.append((fn, rows, ix, ps, matrix))
+  pieces = refined
+  outer = local_derivatives(pieces, shape, lifted_specs, argnums, hessian, full=hessian)
+  gradient = None
+  if hessian:
+    gradients = [(lambda x, *p, fn=fn: jnp.atleast_1d(fn(x, *p)), np.zeros((len(ix), 1), int), ix, ps, matrix) for fn, _, ix, ps, matrix in pieces]
+    gradient = local_derivatives(gradients, (1, shape[1]), lifted_specs, argnums, False)
+
+  jets, prows, jrows, jcols, hrows, hcols = [], [], [np.arange(width)], [np.arange(width)], [], []
+  jet_size = 0
+  for fn, rows, inputs, params, _ in maps:
+    rows = width + np.searchsorted(active, needed[rows])
+    count, outputs, local_width = len(inputs), rows.shape[1], inputs.shape[1]
+    prows.append(rows.reshape(-1) - width)
+    jet_size += count * outputs * local_width ** (2 if hessian else 1)
+    if jet_size > 2_000_000:
+      raise Unsupported("shared map: local derivatives exceed two million entries")
+    jrows.append(np.broadcast_to(rows[:, :, None], (count, outputs, local_width)).reshape(-1))
+    jcols.append(np.broadcast_to(inputs[:, None, :], (count, outputs, local_width)).reshape(-1))
+    r, c = np.tril_indices(local_width)
+    if hessian:
+      hrows.append(np.broadcast_to(rows[:, :, None], (count, outputs, len(r))).reshape(-1))
+      hcols.append(np.broadcast_to((inputs[:, r] * width + inputs[:, c])[:, None, :], (count, outputs, len(r))).reshape(-1))
+
+    def make(fn, inputs, params, r, c):
+      jac = jax.jacfwd(lambda x, *p: (fn(x, *p), fn(x, *p)), has_aux=True)
+
+      def first(x, *p):
+        j, y = jac(x, *p)
+        return j, (y, j)
+
+      second = jax.jacfwd(first, has_aux=True)
+
+      def evaluate(*xs):
+        ps = []
+        axes: list[int | None] = [0]
+        for arg, ids in params:
+          shared = np.all(ids == ids[:1])
+          ps.append(xs[arg].reshape(-1)[ids[0] if shared else ids])
+          axes.append(None if shared else 0)
+        x = xs[argnums].reshape(-1)[inputs]
+        if hessian:
+          h, (y, j) = jax.vmap(second, in_axes=tuple(axes))(x, *ps)
+          h = h[:, :, r, c].reshape(-1)
+        else:
+          j, y = jax.vmap(jac, in_axes=tuple(axes))(x, *ps)
+          h = jnp.zeros(0, x.dtype)
+        return y.reshape(-1), j.reshape(-1), h
+
+      return evaluate
+
+    jets.append(make(fn, inputs, params, r, c))
+  jr, jc = np.concatenate(jrows), np.concatenate(jcols)
+  incidence = np.split(np.argsort(jr, kind="stable"), np.cumsum(np.bincount(jr, minlength=width + len(active)))[:-1])
+  products, rows, cols = [], [], []
+  budget = 0
+  for k, (r, c) in enumerate(zip(outer.rows, outer.cols)):
+    right = incidence[c]
+    budget += len(right) * (len(incidence[r]) if hessian else 1)
+    if budget > 2_000_000:
+      raise Unsupported("shared map: composition exceeds two million contributions")
+    if hessian:
+      left = incidence[r]
+      a, b = np.repeat(left, len(right)), np.tile(right, len(left))
+      keep = jc[a] >= jc[b]
+      a, b = a[keep], b[keep]
+      rows.extend(jc[a])
+      products.extend(zip(np.full(len(a), k), a, b))
+      cols.extend(jc[b])
+    else:
+      rows.extend(np.full(len(right), r))
+      cols.extend(jc[right])
+      products.extend(zip(np.full(len(right), k), right))
+  products = np.asarray(products, dtype=int).reshape(-1, 3 if hessian else 2)
+  hr, hc = (np.concatenate(hrows), np.concatenate(hcols)) if hessian else (np.zeros(0, int), np.zeros(0, int))
+  gi = np.full(shape[1], -1, int)
+  if gradient is not None:
+    gi[gradient.cols] = np.arange(len(gradient.cols))
+  keep = gi[hr] >= 0
+  shape = (width if hessian else shape[0], width)
+  map_primal = assemble([lambda data: data], prows, [np.zeros(len(r), int) for r in prows], (len(active), 1), specs[argnums].dtype, "")
+  restore = np.full(saved.size, len(active) + len(independent), int)
+  restore[active] = np.arange(len(active))
+  restore[independent] = len(active) + np.arange(len(independent))
+
+  def contributions(*xs):
+    evaluated = [jet(*xs) for jet in jets]
+    active_y = map_primal.values(jnp.concatenate([v[0] for v in evaluated]))
+    y = jnp.concatenate([active_y, primal(*xs), jnp.zeros(1, specs[argnums].dtype)])[restore].reshape(saved.shape)
+    lifted = list(xs)
+    lifted[argnums] = jnp.concatenate([xs[argnums].reshape(-1), active_y])
+    lifted.append(y)
+    j = jnp.concatenate([jnp.ones(width, specs[argnums].dtype), *[v[1] for v in evaluated]])
+    values = outer.values(*lifted)[products[:, 0]] * j[products[:, 1]]
+    if gradient is not None:
+      values = values * j[products[:, 2]]
+      h = jnp.concatenate([v[2] for v in evaluated])
+      values = jnp.concatenate([values, gradient.values(*lifted)[gi[hr[keep]]] * h[keep]])
+    return values
+
+  if hessian:
+    rows.extend(hc[keep] // width)
+    cols.extend(hc[keep] % width)
+  report = (
+    f"structured: retained shared map, {len(active)} live dependent outputs of {saved.size}; "
+    f"{sum(len(ix) for _, _, ix, _, _ in maps)} instances, Jacobian and adjoint/Hessian composition; "
+    f"{len(jr) - width} Jacobian entries, {len(hc) if hessian else 0} second derivatives, {len(rows)} contributions\n{outer.report}"
+  )
+  return assemble([contributions], [np.asarray(rows, int)], [np.asarray(cols, int)], shape, specs[argnums].dtype, report)
+
+
+def assemble(evaluators, allrows, allcols, shape, dtype, report):
+  from aotax.sparse import SparseDerivative, _indices
+
   rows = np.concatenate(allrows) if allrows else np.zeros(0, int)
   cols = np.concatenate(allcols) if allcols else np.zeros(0, int)
   keys = rows * shape[1] + cols
@@ -735,14 +964,9 @@ def structured(f, specs, argnums, hessian):
 
   def values(*xs):
     if not evaluators:
-      return jnp.zeros(0, dtype=specs[argnums].dtype)
-    data = jnp.concatenate([*[evaluate(*xs) for evaluate in evaluators], jnp.zeros(1, dtype=specs[argnums].dtype)])
+      return jnp.zeros(0, dtype=dtype)
+    data = jnp.concatenate([*[evaluate(*xs) for evaluate in evaluators], jnp.zeros(1, dtype=dtype)])
     parts = [data[gather[:, 0]] if gather.shape[1] == 1 else data[gather].sum(axis=1) for _, gather in buckets]
     return parts[0] if padded else jnp.concatenate(parts)[restore]
 
-  report = "structured: grouped primal " + ("sums; local hessian (forward over reverse)" if hessian else "outputs; local Jacobians")
-  reports.insert(
-    0,
-    "selection: at most 128 inputs, 512 array operations and backward-demand depth 128; non-matrix Hessians exceeding both width 8 and 128 operations use asdex",
-  )
-  return SparseDerivative(values, _indices(unique_keys // shape[1]), _indices(unique_keys % shape[1]), shape, "\n".join([report, *reports]))
+  return SparseDerivative(values, _indices(unique_keys // shape[1]), _indices(unique_keys % shape[1]), shape, report)

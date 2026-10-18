@@ -367,3 +367,72 @@ def test_hessian_keeps_primal_values_with_zero_derivative_columns(custom, tmp_pa
 
     native = aotax.compile(result.values, *args, out=tmp_path).load()
     np.testing.assert_allclose(native(*args), result.values(*args), rtol=1e-11, atol=1e-11)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+@pytest.mark.parametrize("nonlinear_sum", [False, True])
+def test_shared_map_composition(hessian, nonlinear_sum, tmp_path):
+  pairs = np.array([[0, 1], [1, 2], [2, 0], [2, 2]])
+
+  def f(x, w, p, lam):
+    h = jnp.sin(x.reshape(4, 3) @ w) + p
+    a, b = h[pairs[:, 0]], h[pairs[:, 1]]
+    y = jnp.stack([jnp.exp(a[:, 0] * b[:, 1]), jnp.sin(a[:, 1] + b[:, 0])], axis=1)
+    y = jnp.concatenate([y.reshape(-1), h[:, :2].reshape(-1)])
+    y = y * (1 + x[np.arange(16) % 12])
+    y = jnp.atleast_1d(jnp.sum(y) ** 2) if nonlinear_sum else y
+    return lam @ y if hessian else y
+
+  rng = np.random.default_rng(3)
+  args = rng.normal(scale=0.2, size=12), rng.normal(scale=0.2, size=(3, 5)), rng.normal(scale=0.2, size=5), np.ones(1 if nonlinear_sum else 16)
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, method="structured")
+  assert "retained shared map, 8 live dependent outputs of 20" in result.report
+  for _ in range(3):
+    changed = tuple(a + rng.normal(scale=0.1, size=a.shape) for a in args)
+    check_sparse(result, f, changed, hessian=hessian)
+  products = [e for e in jax.make_jaxpr(result.values)(*args).jaxpr.eqns if e.primitive.name == "dot_general"]
+  weights = [e for e in products if any(getattr(v.aval, "shape", None) == (3, 2) for v in e.invars)]
+  assert weights and all(not any(e.params["dimension_numbers"][1]) for e in weights)
+  if hessian and not nonlinear_sum:
+    import aotax
+
+    native = aotax.compile(result.values, *args, out=tmp_path).load()
+    np.testing.assert_allclose(native(*args), result.values(*args), rtol=1e-11, atol=1e-11)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+def test_shared_map_preserves_custom_rules_and_passive_outputs(hessian):
+  @jax.custom_jvp
+  def custom(a, b):
+    return a * a + b
+
+  @custom.defjvp
+  def rule(primals, tangents):
+    a, b = primals
+    da, db = tangents
+    return custom(a, b), da * a * b + 2 * db
+
+  def f(x, p):
+    z = x.reshape(4, 2)
+    h = jnp.stack([custom(z[:, 0], z[:, 1]) + p, p, z[:, 1] ** 3], axis=1)
+    a, b = h[np.array([0, 1, 2])], h[np.array([1, 2, 0])]
+    y = custom(a[:, 0], b[:, 0]) * a[:, 1]
+    return y.sum() if hessian else y
+
+  args = np.linspace(-0.3, 0.5, 8), np.linspace(0.2, 0.7, 4)
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, method="structured")
+  assert "3 live dependent outputs of 12" in result.report
+  check_sparse(result, f, args, hessian=hessian)
+
+
+def test_shared_map_slices_after_flat_extraction_budget():
+  def f(x):
+    h = x.reshape(6, 2)
+    for _ in range(36):
+      h = jnp.sin(h + 0.1 * h[:, ::-1])
+    return jnp.sin(h[:-1].sum(axis=1) * h[1:].sum(axis=1)).sum()
+
+  args = (np.linspace(-0.3, 0.4, 12),)
+  result = sparse_hessian(f, *args, method="structured")
+  assert "retained shared map" in result.report
+  check_sparse(result, f, args, hessian=True)

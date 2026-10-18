@@ -255,6 +255,10 @@ Outputs that share nonlinear work are grouped before
 Jacobian differentiation. Hessians differentiate weighted local primal sums with forward
 mode over reverse mode, then add their overlapping lower triangles. Nonlinear functions of
 sums remain intact. Duplicate input coordinates are deduplicated before differentiation.
+When static gathers reuse a computed map, extraction retains its live dependent outputs,
+evaluates the map and its derivatives once per instance, and composes local Jacobians and
+Hessians with downstream adjoints. Overlapping slices can use the same composition when
+flat extraction exceeds its budget. Input-independent outputs remain runtime coefficients.
 
 Small programs without matrix products use scalar input leaves to remove absent tangents.
 Jacobians use forward mode when the local input width is at most the output count, and
@@ -266,7 +270,8 @@ Selection uses graph properties, without timing kernels: local programs have at 
 selected inputs, 512 array operations and a backward-demand depth of 128. Non-matrix Hessians exceeding both width 8 and
 128 operations use asdex because scalar second derivatives grow too large. Wide Jacobian
 neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
-maps selected by gathers, general control flow and non-pointwise custom rules also fall back.
+maps with multiple computed gather sources, general control flow and non-pointwise custom rules also fall back.
+Shared-map derivatives and their composition each have a two-million-entry construction budget.
 
 ## Benchmarks
 

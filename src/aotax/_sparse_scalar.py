@@ -80,15 +80,18 @@ def scalarize(fn, *specs):
   return scalar_fn
 
 
-def differentiate(fn, specs, hessian, matrix, outputs):
+def differentiate(fn, specs, hessian, matrix, outputs, *, full=False):
   derivative: Callable[..., Any]
   width = specs[0].size
   mode = "hessian" if hessian else ("jacfwd" if width <= outputs else "jacrev")
   if matrix:
     from aotax.sparse import _asdex
 
-    pattern = _asdex(fn, specs, 0, hessian)
-    r, c = pattern.rows, pattern.cols
+    if hessian and full:
+      r, c = np.indices((width, width)).reshape(2, -1)
+    else:
+      pattern = _asdex(fn, specs, 0, hessian)
+      r, c = pattern.rows, pattern.cols
     # A zero derivative column can still supply a runtime primal coefficient.
     array_derivative = (jax.hessian if hessian else (jax.jacfwd if width <= outputs else jax.jacrev))(fn)
 
@@ -97,7 +100,7 @@ def differentiate(fn, specs, hessian, matrix, outputs):
 
   else:
     sf = scalarize(fn, *specs)
-    r, c = np.tril_indices(width) if hessian else np.indices((outputs, width)).reshape(2, -1)
+    r, c = np.tril_indices(width) if hessian and not full else np.indices((width, width) if hessian else (outputs, width)).reshape(2, -1)
     if hessian:
       derivative = jax.hessian(sf)
     elif width <= outputs:
