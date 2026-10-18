@@ -30,7 +30,19 @@ class Workload:
   lower_triangle: bool = True
 
 
-def discover() -> dict[str, Workload]:
+@dataclass(frozen=True)
+class ProgramWorkload:
+  """Complete JAX programs, with positional pytree arguments and per-leaf (rtol, atol)."""
+
+  name: str
+  sizes: tuple[str, ...]
+  axes: Callable[[str], dict[str, int]]
+  inputs: Callable[[str], tuple[Any, ...]]
+  function: Callable[[str], Callable[..., Any]]
+  tolerances: Callable[[str], tuple[tuple[float, float], ...]]
+
+
+def discover() -> dict[str, Workload | ProgramWorkload]:
   workloads = {}
   for path in sorted((Path(__file__).parent / "workloads").glob("*.py")):
     if path.name.startswith("_"):
