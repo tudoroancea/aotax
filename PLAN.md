@@ -117,7 +117,7 @@ new modules until their design is settled.
 
 - [x] I. `compile(approximate_math=False)` gives libm-quality elementary functions by default. CPU
   keeps f64 `sin`/`cos`/`exp`/`log`/`tanh` in dispatches and promotes f32 ones to f64; other
-  functions call generated libm adapters, and JAX's `erfc`/`exp2`/`log2`/`log10` are preserved
+  functions call generated libm adapters, and JAX's `erfc`/`exp2`/`log2` are preserved
   before export. The default keeps subnormals; opt-in flushes them (as XLA's CPU backend does),
   expands f64 `exp` and keeps IREE's approximations, which no 3.12 option disables. Dense sweeps
   of 24 functions stay within 2 ulp. Opt-in is 2-6% faster on npmpc, equal on race cars, 3.6× on

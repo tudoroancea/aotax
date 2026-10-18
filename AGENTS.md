@@ -41,8 +41,9 @@ uv run --group bench benchmarks/bench.py --reps 5
 - IREE 3.12's `slow_memcpy` dispatch mishandles overlapping self-slices in `dynamic_update_slice`.
 - Accurate CPU math keeps f64 `sin`, `cos`, `exp`, `log`, `tanh` in dispatches and promotes their
   f32 equivalents. Other elementary functions use libm adapters, including `expm1`/`log1p` because
-  IREE rewrites even f64 to cancellation-prone expressions. Preserve JAX's `erfc`, `exp2`, `log2`
-  and `log10` primitives before export; their StableHLO decompositions already lose accuracy.
+  IREE rewrites even f64 to cancellation-prone expressions. Preserve JAX's `erfc`, `exp2` and `log2`
+  primitives before export; their StableHLO decompositions lose accuracy. JAX traces `log10` as `log`
+  times a constant, within 2 ulp.
 - IREE 3.12's math transform pass has no disable option. Opt-in retains its f32 approximations;
   `sin`/`cos` have ~3e-5 absolute error near |x|=1e3 and fail badly at 1e10. CPU f64 `cbrt` needs
   libm in both modes because IREE cannot lower it.

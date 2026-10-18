@@ -211,7 +211,7 @@ def test_accurate_elementary_math(tmp_path, metal, name):
   np.testing.assert_array_equal(np.isnan(got), np.isnan(want))
   np.testing.assert_array_equal(np.isinf(got), np.isinf(want))
   np.testing.assert_array_equal(np.signbit(got[~np.isnan(want)]), np.signbit(want[~np.isnan(want)]))
-  assert max_ulp(got, want) <= 4
+  assert max_ulp(got, want) <= 2
 
 
 @pytest.mark.parametrize("approximate", [False, True])

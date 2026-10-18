@@ -753,4 +753,4 @@ static uint64_t fpu_enter(void) {{
   if (state != FPU_MODE(state)) fpu_set(FPU_MODE(state));
   return state;
 }}
-static void fpu_leave(uint64_t state) {{ if (state != FPU_MODE(state)) fpu_set(state); }}"""
+static void fpu_leave(uint64_t state) {{ if (fpu_get() != state) fpu_set(state); }}"""

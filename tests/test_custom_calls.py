@@ -432,6 +432,10 @@ def test_foreign_registry_and_tokens(tmp_path):
     aotax.Foreign("user_step", scratch=-1)
   with pytest.raises(ValueError, match="nonempty target"):
     aotax.compile(lambda x: x, np.ones(3), name="fn", out=tmp_path, foreign={"": "user_step"})
+  with pytest.raises(ValueError, match="reserved"):
+    aotax.compile(lambda x: x, np.ones(3), name="fn", out=tmp_path, foreign={"aotax.math.log2": "user_step"})
+  with pytest.raises(ValueError, match="reserved"):
+    aotax.compile(lambda x: x, np.ones(3), name="fn", out=tmp_path, foreign={"test_step": "aotax_math0"})
   with pytest.raises(ValueError, match="test_step"):
     aotax.compile(lambda x: foreign_step(x, np.int64(0)), np.ones(3), name="fn", out=tmp_path, foreign={"another": "user_step"})
 
@@ -487,3 +491,26 @@ def test_foreign_and_lapack(tmp_path):
   got, count = lib.load(extra=[obj])(a, b)
   np.testing.assert_array_equal(got, b)
   assert count == 1
+
+
+@pytest.mark.skipif(os.uname().machine != "arm64", reason="sets the arm64 floating-point control register")
+def test_foreign_mode_change_is_restored(tmp_path):
+  def fn(x):
+    return jax.ffi.ffi_call("test_flush", jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+  lib = aotax.compile(fn, np.ones(3), out=tmp_path, foreign={"test_flush": "user_flush"})
+  obj = build_foreign(
+    lib,
+    """int user_flush(const aotax_ffi_tensor* in, size_t ni, const aotax_ffi_tensor* out, size_t no, void* scratch) {
+  uint64_t fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  __asm__ volatile("msr fpcr, %0" : : "r"(fpcr | UINT64_C(0x1080000)));
+  for (size_t i = 0; i < 3; ++i) ((double*)out[0].data)[i] = ((const double*)in[0].data)[i];
+  return 0;
+}
+""",
+  )
+  tiny = np.array([1e-310])
+  before = tiny * 1e300
+  np.testing.assert_array_equal(lib.load(extra=[obj])(np.ones(3)), np.ones(3))
+  np.testing.assert_array_equal(tiny * 1e300, before)

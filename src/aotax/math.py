@@ -28,7 +28,7 @@ FUNCTIONS = {
 }
 COMPOSITES = {f"chlo.{name}": name for name in ("asin", "acos", "atan", "asinh", "acosh", "atanh", "sinh", "cosh", "tan", "erf", "erfc")}
 DISPATCH_MATH = {"sin", "cos", "exp", "log", "tanh"}
-PRESERVED = {name: core.Primitive(f"aotax_{name}") for name in ("erfc", "exp2", "log2", "log10")}
+PRESERVED = {name: core.Primitive(f"aotax_{name}") for name in ("erfc", "exp2", "log2")}
 
 
 for _name, _primitive in PRESERVED.items():
@@ -37,12 +37,17 @@ for _name, _primitive in PRESERVED.items():
 
 
 def preserve_math(fn, args):
-  closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
+  # A fresh callable, so make_jaxpr's cache cannot return constants captured by an earlier compile.
+  closed, shapes = jax.make_jaxpr(lambda *a: fn(*a), return_shape=True)(*args)
   tree = jax.tree.structure(shapes)
+
+  def swap(e):
+    preserved = PRESERVED.get(e.primitive.name)
+    return preserved if preserved and e.outvars[0].aval.dtype in (jnp.float32, jnp.float64) else e.primitive
 
   def rewrite(value):
     if isinstance(value, core.Jaxpr):
-      return value.replace(eqns=[e.replace(primitive=PRESERVED.get(e.primitive.name, e.primitive), params=rewrite(e.params)) for e in value.eqns])
+      return value.replace(eqns=[e.replace(primitive=swap(e), params=rewrite(e.params)) for e in value.eqns])
     if isinstance(value, dict):
       return {key: rewrite(v) for key, v in value.items()}
     if type(value) in (tuple, list):

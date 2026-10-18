@@ -116,6 +116,8 @@ def compile(
   for target, spec in targets.items():
     if not isinstance(target, str) or not target or not isinstance(spec, Foreign):
       raise ValueError("aotax: foreign must map nonempty target names to C symbols or Foreign declarations")
+    if target.startswith("aotax.") or spec.symbol.startswith("aotax_"):
+      raise ValueError(f"aotax: foreign target {target!r} or symbol {spec.symbol!r} uses a reserved aotax prefix")
   out = Path(out)
   work = out / "iree"
   work.mkdir(parents=True, exist_ok=True)

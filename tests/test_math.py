@@ -45,7 +45,8 @@ def inputs(name, dtype):
     large = np.geomspace(1, float(info.max) / 2, 5001)
     x = np.r_[x, large, -large, np.linspace(-1e4, 1e4, 10001), -1e10, 1e10]
   elif name in {"exp", "exp2", "expm1", "sinh", "cosh"}:
-    x = np.r_[x, np.linspace(np.log(info.smallest_subnormal) - 2, np.log(info.max) + 2, 10001)]
+    log = np.log2 if name == "exp2" else np.log
+    x = np.r_[x, np.linspace(log(info.smallest_subnormal) - 2, log(info.max) + 2, 10001)]
   elif name in {"log", "log2", "log10", "log1p", "arccosh"}:
     x = np.r_[x, np.geomspace(float(small), float(info.max) / 2, 10001), np.linspace(0.9, 1.1, 10001)]
   elif name in {"arcsin", "arccos", "arctanh"}:
@@ -88,7 +89,7 @@ def test_accurate_math(tmp_path, name, dtype):
   np.testing.assert_array_equal(np.isnan(got), np.isnan(want))
   np.testing.assert_array_equal(np.isinf(got), np.isinf(want))
   np.testing.assert_array_equal(np.signbit(got[~np.isnan(want)]), np.signbit(want[~np.isnan(want)]))
-  assert max_ulp(got, want) <= 4
+  assert max_ulp(got, want) <= 2
 
 
 @pytest.mark.parametrize("name", FUNCTIONS)
@@ -127,3 +128,25 @@ def test_approximate_f64_cbrt(tmp_path):
   x = np.linspace(-100, 100, 1001)
   got = aotax.compile(jnp.cbrt, x, out=tmp_path, name="math", approximate_math=True).load()(x)
   assert max_ulp(got, np.cbrt(x)) <= 4
+
+
+def test_recompile_reads_current_constants(tmp_path):
+  weights = np.array([1.0, 2.0, 3.0])
+
+  def fn(x):
+    return x + weights
+
+  x = np.array([10.0, 20.0, 30.0])
+  aotax.compile(fn, x, out=tmp_path / "old")
+  weights = np.array([4.0, 5.0, 6.0])
+  np.testing.assert_array_equal(aotax.compile(fn, x, out=tmp_path / "new").load()(x), x + weights)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float16, jnp.complex64])
+def test_preserved_math_skips_other_dtypes(tmp_path, dtype):
+  def fn(x):
+    return jnp.real(jnp.exp2(x.astype(dtype)) + jnp.log2(x.astype(dtype))).astype(jnp.float32)
+
+  x = np.linspace(0.5, 2, 9, dtype=np.float32)
+  loaded = aotax.compile(fn, x, out=tmp_path).load()
+  np.testing.assert_allclose(loaded(x), fn(x), rtol=2e-3)
