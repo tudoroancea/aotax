@@ -122,7 +122,9 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
   library.header.write_text(_header(library))
   queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
   blas = contractions(sources) if sys.platform == "darwin" else {}
-  (work / "host.c").write_text(host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas, binding_writes(sources)))
+  (work / "host.c").write_text(
+    host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas, binding_writes(sources), exported.module_kept_var_idx)
+  )
   cc = os.environ.get("CC", "cc")
   subprocess.run(
     [

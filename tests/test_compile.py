@@ -313,3 +313,10 @@ def test_exp_range_and_special_values(tmp_path):
   finite = np.isfinite(expected) & (expected != 0)
   np.testing.assert_array_equal(got[~finite], expected[~finite])
   assert np.all(np.abs(got[finite] - expected[finite]) <= 2 * np.spacing(expected[finite]))
+
+
+def test_unused_middle_argument(tmp_path):
+  def update(x, unused, i):
+    return x.at[i].set(42.0)
+
+  check(update, np.arange(4.0), np.full(3, 7.0), np.int64(2), tmp_path=tmp_path)

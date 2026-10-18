@@ -63,8 +63,9 @@ def _data(attr) -> bytes:
 
 
 class _Host:
-  def __init__(self, lib: Any, module, queries: list[str], blas, writes):
+  def __init__(self, lib: Any, module, queries: list[str], blas, writes, kept):
     self.lib = lib
+    self.kept = kept
     self.queries = queries
     self.blas = blas
     self.writes = writes
@@ -149,7 +150,7 @@ class _Host:
         start += size
       return groups
 
-    origins = {v: {i} for i, v in enumerate(blocks[0].arguments)} if main else {}
+    origins = {v: {self.kept[i]} for i, v in enumerate(blocks[0].arguments)} if main else {}
     aliases = []
     for o in ops:
       for r in o.results:
@@ -332,7 +333,7 @@ class _Host:
 
     if main:
       for i, arg in enumerate(blocks[0].arguments):
-        emit(f"{names[arg]} = inputs[{i}];")
+        emit(f"{names[arg]} = inputs[{self.kept[i]}];")
     for bi, b in enumerate(blocks):
       emit(f"b{bi}:;")
       for oo in b.operations:
@@ -488,7 +489,7 @@ class _Host:
     return f"static int run{number}({self.lib.name}_context* c{parameters}) {{\n" + "\n".join(declarations + code) + "\n}\n"
 
 
-def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes) -> str:
+def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes, kept) -> str:
   with ir.Context():
     module = ir.Module.parse(text)
     # CPU imports bind embedded memory directly; their allocation fallback is unreachable.
@@ -511,7 +512,7 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes) 
       op.results[0].replace_all_uses_with(imported.results[0])
     if imports:
       passes.PassManager.parse("builtin.module(canonicalize)").run(module.operation)
-    h = _Host(lib, module, queries, blas, writes)
+    h = _Host(lib, module, queries, blas, writes, kept)
     functions = [h.function(fn, i) for i, fn in enumerate(h.functions)]
   n = lib.name
   ins, outs = len(lib.in_avals), len(lib.out_avals)
