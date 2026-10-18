@@ -70,10 +70,12 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
   unchanged `jnp.linalg.solve`, `cholesky` and `solve_triangular` compile. A solve takes 0.31 µs at
   n=4 and 15.6 µs at n=64; the five H0 workloads run 2-4× faster than JAX called from Python.
   Reviewed by Opus 5.5 (xhigh), fixes checked by Fable 5.1.
-- [ ] H1c. User FFI targets: explicit `foreign` registry, tensor descriptors, optional context scratch,
+- [x] H1c. User FFI targets: explicit `foreign` registry, tensor descriptors, optional context scratch,
   selective export exemptions and `load(extra=...)` linking. Full checks pass. Scaly Newton inside
   an eight-solve continuation loop takes 4.82 µs against direct Scaly's 4.59 µs, agrees with JAX
-  to 2.8e-16; `/tmp/aotax-h1c/scaly_foreign.py`. Cross-family review pending.
+  to 2.8e-16; `/tmp/aotax-h1c/scaly_foreign.py`. Fable 5.1 high-effort review approved with no
+  act-on findings. IREE 3.12's scalar-result loop crash is documented; vector statistics work.
+  Two small review notes addressed; local checks pass. Delta review blocked by Claude's rate limit.
 - [ ] H2. The H0 workloads in the benchmark harness, against Scaly's generated solvers where an
   equivalent exists and against JAX's own XLA CPU execution.
 

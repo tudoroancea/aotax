@@ -138,7 +138,8 @@ lists every specialization's inputs, results and scratch size.
 
 Calls are synchronous. Inputs are borrowed and immutable; fill every result in its fresh buffer
 and retain no pointers after returning. Return zero on success or nonzero for an execution error.
-Keep numerical status, such as solver convergence, in tensor results. For temporary storage,
+Keep numerical status, such as solver convergence, in tensor results. Foreign code runs with the
+library's floating-point mode, which flushes subnormals to zero. For temporary storage,
 use `aotax.Foreign("my_twice", scratch=256)` in the registry. Scratch lives in the context,
 is aligned to 64 bytes and is reused without clearing. With no scratch request the pointer is null.
 

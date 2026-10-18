@@ -146,7 +146,8 @@ def _specialize(op, foreign):
       "output_operand_aliases",
     }
     require("output_operand_aliases" not in op.attributes or not len(op.attributes["output_operand_aliases"]), "output aliases are unsupported")
-    require(all(key in allowed for key in op.attributes), "unsupported attributes or opaque state")
+    unknown = sorted(set(op.attributes) - allowed)
+    require(not unknown, f"unsupported attributes or opaque state: {', '.join(unknown)}")
     for key in ("mhlo.backend_config", "backend_config"):
       if key in op.attributes:
         value = op.attributes[key]
