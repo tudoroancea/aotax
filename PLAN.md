@@ -13,8 +13,10 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 
 ## Reviews
 
-- [ ] Review G1b (Metal) and F2, and the delta checks H1c and H2 missed: Claude's rate limit
-  blocked them inside the agents.
+- [x] G1b (Metal), F2 and the merge: gpt-6.1-sol (xhigh) found Metal's default fast math breaking
+  NaN, infinity and zero semantics; fixed with `MTLMathModeSafe` and nonfinite tests, checked by
+  gpt-6.1-sol (high). IREE's float32 `sin`/`cos` lose accuracy beyond |x| ≈ 1e3 on CPU and Metal;
+  documented as a limit. H1c and H2 delta checks: resolved (Fable 5.1, low).
 
 ## Review of phase 1
 
