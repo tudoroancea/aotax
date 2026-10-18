@@ -125,6 +125,15 @@ def test_scalar_while_jacobian_uses_forward_mode():
     assert "asdex fwd" in result.report
 
 
+def test_shared_coordinate_assembly_storage_is_linear():
+  n = 256
+  f = lambda x: jnp.sin(x[0] + x[1:]).sum()
+  args = (np.linspace(0.1, 0.5, n + 1),)
+  result = check(f, args, hessian=True)
+  closed = jax.make_jaxpr(result.values)(*args)
+  assert sum(np.asarray(c).nbytes for c in closed.consts) < 128 * n
+
+
 @pytest.mark.parametrize("mode", ["clip", "drop", "promise_in_bounds"])
 def test_asdex_rejects_out_of_bounds_scatter(mode):
   pytest.importorskip("asdex")

@@ -716,18 +716,31 @@ def structured(f, specs, argnums, hessian):
   keys = rows * shape[1] + cols
   unique_keys, inverse, counts = np.unique(keys, return_inverse=True, return_counts=True)
   width = counts.max(initial=1)
-  gather = np.full((len(unique_keys), width), len(keys), dtype=np.int32)
   order = np.argsort(inverse, kind="stable")
-  starts = np.r_[0, np.cumsum(counts)[:-1]]
-  if len(keys):
-    gather[inverse[order], np.arange(len(order)) - np.repeat(starts, counts)] = order
+  starts = np.cumsum(counts) - counts
+  buckets = []
+  # Bounded padding keeps the common assembly unchanged; uneven counts use exact buckets.
+  padded = len(unique_keys) * width <= 2 * len(keys)
+  for count in [width] if padded else np.unique(counts):
+    positions = np.arange(len(counts)) if padded else np.flatnonzero(counts == count)
+    gather = np.full((len(positions), count), len(keys), dtype=np.int32)
+    if padded:
+      gather[inverse[order], np.arange(len(order)) - np.repeat(starts, counts)] = order
+    else:
+      gather[:] = order[starts[positions, None] + np.arange(count)]
+    buckets.append((positions, gather))
+  restore = np.argsort(np.concatenate([positions for positions, _ in buckets])) if buckets else np.zeros(0, int)
 
   def values(*xs):
     if not evaluators:
       return jnp.zeros(0, dtype=specs[argnums].dtype)
     data = jnp.concatenate([*[evaluate(*xs) for evaluate in evaluators], jnp.zeros(1, dtype=specs[argnums].dtype)])
-    return data[gather[:, 0]] if width == 1 else data[gather].sum(axis=1)
+    parts = [data[gather[:, 0]] if gather.shape[1] == 1 else data[gather].sum(axis=1) for _, gather in buckets]
+    return parts[0] if padded else jnp.concatenate(parts)[restore]
 
   report = "structured: grouped primal " + ("sums; local hessian (forward over reverse)" if hessian else "outputs; local Jacobians")
-  reports.insert(0, "selection: at most 128 inputs and 512 array operations; non-matrix Hessians exceeding both width 8 and 128 operations use asdex")
+  reports.insert(
+    0,
+    "selection: at most 128 inputs, 512 array operations and backward-demand depth 128; non-matrix Hessians exceeding both width 8 and 128 operations use asdex",
+  )
   return SparseDerivative(values, _indices(unique_keys // shape[1]), _indices(unique_keys % shape[1]), shape, "\n".join([report, *reports]))
