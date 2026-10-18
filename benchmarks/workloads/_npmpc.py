@@ -44,7 +44,7 @@ P_TERMINAL = slice(P_COST.stop, P_COST.stop + NX * NX)
 N_P = P_TERMINAL.stop
 
 PHI_LIMIT, TORQUE_LIMIT, SLACK_LIMIT, X0_BAND = 2.0, 0.05, 5.0, 1e-3
-CHECKPOINT = Path(__file__).parent / "data" / "cnp_model.pth"
+CHECKPOINT = Path(__file__).parents[1] / "data" / "cnp_model.pth"
 
 
 def n_z(N: int) -> int:
@@ -186,3 +186,26 @@ def sample_inputs(N: int, seed: int = 11) -> tuple[np.ndarray, np.ndarray, np.nd
 def dense_hessian(N: int, z: np.ndarray, p: np.ndarray, lam_g: np.ndarray) -> np.ndarray:
   """The dense Lagrangian Hessian by plain `jax.hessian`, independent of any sparsity detection."""
   return np.asarray(jax.jit(jax.hessian(lagrangian_jax), static_argnums=3)(z, p, lam_g, N))
+
+
+def constraints_jax(z, p, N: int):
+  """Dynamics, initial-state band and soft arm-angle bounds, in solver row order."""
+  X = z[: NX * (N + 1)].reshape(N + 1, NX)
+  U = z[NX * (N + 1) : -1].reshape(N, NU)
+  eq = jax.vmap(stage_jax, in_axes=(0, 0, 0, None, None))(X[:-1], X[1:], U, p[P_PW], p[P_DT]).reshape(-1)
+  return jnp.concatenate([eq, X[0] - p[:NX], X[:, 1] + z[-1], X[:, 1] - z[-1]])
+
+
+def constraints_scaly(N: int) -> sc.Function:
+  """The full solver constraint vector as a Scaly Function."""
+  offset = NX * (N + 1)
+
+  @sc.function(sc.arg("z", n_z(N)), sc.arg("p", N_P), outputs=sc.arg("g", n_g(N)), name=f"npmpc_constraints_N{N}")
+  def constraints(z: sc.Expr, p: sc.Expr) -> sc.Expr:
+    eq = sc.vmap(_stage_scaly(), N)(
+      sc.window(z, 0, NX), sc.window(z, NX, NX), sc.window(z, offset, NU), sc.broadcast(p[P_PW]), sc.broadcast(p[P_DT : P_DT + 1].reshape(()))
+    ).vec()
+    phi, slack = z[1:offset:NX], z[-1]
+    return sc.concat([eq, z[:NX] - p[:NX], phi + slack, phi - slack])
+
+  return constraints

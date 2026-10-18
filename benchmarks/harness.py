@@ -1,4 +1,4 @@
-"""Lower the npmpc Hessian through Scaly or aotax, link it behind cpp/main.cpp with Google Benchmark, and time the binary."""
+"""Lower sparse workloads, build correctness-gated Google Benchmark binaries, and time them."""
 
 import json
 import shutil
@@ -9,14 +9,13 @@ from functools import cache
 from pathlib import Path
 
 import cmake
-import hessian
 import jax
-import jax.numpy as jnp
 import ninja
 import numpy as np
-import problem
+from scaly.codegen.abi import c_ident
 from scaly.codegen.aot import render_c_module
 from scaly.codegen.toolchain import find_c_compiler, native_recipe
+from workload import Inputs, Workload
 
 import aotax
 
@@ -55,7 +54,7 @@ def gbench() -> Path:
 
 @dataclass(frozen=True)
 class Kernel:
-  """One backend's generated files in `dir`: `sources` to compile with the harness flags, `libs` to link, `adapter` the file in cpp/ behind kernel.h."""
+  """Generated sources, libraries, sparse coordinates and adapter in `dir`."""
 
   dir: Path
   rows: np.ndarray
@@ -65,61 +64,73 @@ class Kernel:
   libs: tuple[str | Path, ...] = ()
 
 
-def lower_scaly(N: int, out: Path) -> Kernel:
-  """`sc.sparse_hessian` of the Scaly Lagrangian, rendered to one C source with the vector math library Scaly selects on this host."""
-  function, rows, cols = hessian.scaly_lower(N)
+def lower_scaly(workload: Workload, size: int, out: Path, inputs: Inputs) -> Kernel:
+  """Render the workload's Scaly sparse kernel."""
+  function, rows, cols = workload.scaly(size)
   compiler = find_c_compiler()
   vector_libm = native_recipe(compiler.command).vector_libm if compiler is not None else "none"
-  module = render_c_module(function, header_name="npmpc_hess.h", source_name="npmpc_hess.c", vector_libm=vector_libm)
+  module = render_c_module(function, header_name="generated.h", source_name="generated.c", vector_libm=vector_libm)
   (out / module.header_name).write_text(module.header)
   (out / module.source_name).write_text(module.source)
-  return Kernel(out, rows, cols, adapter="scaly.c", sources=(out / module.source_name,))
+  name = c_ident(function.name)
+  adapter = (CPP / "scaly.c").read_text().replace("GENERATED", name)
+  (out / "adapter.c").write_text(adapter)
+  return Kernel(out, rows, cols, adapter="adapter.c", sources=(out / module.source_name,))
 
 
-def lower_aotax(N: int, out: Path) -> Kernel:
-  """asdex's sparse Hessian of the JAX Lagrangian, compiled by aotax into `npmpc_hess.h` and `libnpmpc_hess.a`."""
-  function, rows, cols = hessian.asdex_lower(N)
-  specs = [jax.ShapeDtypeStruct((size,), jnp.float64) for size in (problem.n_z(N), problem.N_P, problem.n_g(N))]
-  library = aotax.compile(function, *specs, out=out, name="npmpc_hess")
-  return Kernel(out, rows, cols, adapter="aotax.c", libs=(library.archive, *aotax.SYSTEM_LIBS))
+def lower_aotax(workload: Workload, size: int, out: Path, inputs: Inputs) -> Kernel:
+  """Compile the workload's sparse JAX kernel."""
+  function, rows, cols = workload.aotax(size)
+  specs = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in inputs.values()]
+  library = aotax.compile(function, *specs, out=out, name="generated")
+  args = ", ".join([*(f"g_inputs[{i}]" for i in range(len(inputs))), "out"])
+  adapter = (CPP / "aotax.c").read_text().replace("CALL_ARGS", args)
+  (out / "adapter.c").write_text(adapter)
+  return Kernel(out, rows, cols, adapter="adapter.c", libs=(library.archive, *aotax.SYSTEM_LIBS))
 
 
-def write_inputs(directory: Path, N: int) -> Path:
-  """The sample inputs and the dense reference Hessian, as raw doubles the harness reads at startup."""
+def write_inputs(directory: Path, workload: Workload, size: int, inputs: Inputs) -> np.ndarray:
+  """Write named float64 inputs and an independent dense reference as raw doubles."""
   directory.mkdir(parents=True, exist_ok=True)
-  z, p, lam_g = problem.sample_inputs(N)
-  for name, values in (("z", z), ("p", p), ("lam_g", lam_g), ("hessian", problem.dense_hessian(N, z, p, lam_g))):
-    np.asarray(values, dtype=np.float64).tofile(directory / f"{name}.bin")
-  return directory
+  for name, values in inputs.items():
+    if values.dtype != np.float64:
+      raise ValueError(f"{name}: expected float64, got {values.dtype}")
+    values.tofile(directory / f"{name}.bin")
+  reference = np.asarray(workload.reference(size, inputs), dtype=np.float64)
+  if reference.ndim != 2:
+    raise ValueError("reference must be a matrix")
+  reference.tofile(directory / "reference.bin")
+  return reference
 
 
-def build(kernel: Kernel, N: int, inputs: Path) -> Path:
-  """Compile the adapter, cpp/main.cpp and any generated C, and link them with the backend's libraries into `dir/bin/benchmark`."""
+def build(kernel: Kernel, workload: Workload, inputs: Inputs, reference: np.ndarray, directory: Path) -> Path:
+  """Compile the adapter and shared correctness/timing binary."""
   out = kernel.dir / "bin"
-  shutil.rmtree(out, ignore_errors=True)
   out.mkdir()
   (out / "layout.h").write_text(
     "\n".join(
       [
-        "// Input sizes and where each output value sits in the Hessian, for this backend at this horizon.",
-        f"#define NZ {problem.n_z(N)}",
-        f"#define NP {problem.N_P}",
-        f"#define NLAM {problem.n_g(N)}",
+        f"#define NINPUTS {len(inputs)}",
+        f"#define NROWS {reference.shape[0]}",
+        f"#define NCOLS {reference.shape[1]}",
+        f"#define LOWER_TRIANGLE {int(workload.lower_triangle)}",
         f"#define NNZ {kernel.rows.size}",
         f"static const int ROWS[NNZ] = {{{', '.join(map(str, kernel.rows))}}};",
         f"static const int COLS[NNZ] = {{{', '.join(map(str, kernel.cols))}}};",
+        f"static const int INPUT_SIZES[NINPUTS] = {{{', '.join(str(v.size) for v in inputs.values())}}};",
+        "static const char* INPUT_NAMES[NINPUTS] = {" + ", ".join(json.dumps(n + ".bin") for n in inputs) + "};",
         "",
       ]
     )
   )
   flags = [*FLAGS, "-I", CPP, "-I", out, "-I", kernel.dir]
   objects = []
-  for source in (*kernel.sources, CPP / kernel.adapter, CPP / "main.cpp"):
+  for source in (*kernel.sources, kernel.dir / kernel.adapter, CPP / "main.cpp"):
     obj = out / f"{source.stem}.o"
     if source.suffix == ".c":
       run(["clang", *flags, "-c", source, "-o", obj])
     else:
-      run(["clang++", *flags, "-std=c++17", "-I", gbench() / "include", f'-DINPUTS_DIR="{inputs}"', "-c", source, "-o", obj])
+      run(["clang++", *flags, "-std=c++17", "-I", gbench() / "include", f'-DINPUTS_DIR="{directory}"', "-c", source, "-o", obj])
     objects.append(obj)
   binary = out / "benchmark"
   run(["clang++", "-pthread", *objects, "-o", binary, *kernel.libs, gbench() / "lib" / "libbenchmark.a", *VECTOR_LIBM, "-lm"])
