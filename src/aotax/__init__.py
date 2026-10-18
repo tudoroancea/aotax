@@ -17,6 +17,7 @@ from iree.compiler.tools import binaries
 from jax.core import ShapedArray
 
 from aotax.blas import contractions
+from aotax.cpu import fill_small_tiles
 from aotax.custom_calls import FFI_HEADER, Foreign, rewrite_custom_calls
 from aotax.host import binding_writes, host
 from aotax.math import expand_math
@@ -154,10 +155,29 @@ def compile(
       "--compile-to=hal",
       "--iree-hal-memoization=false",
     )
+  input_path = work / "stablehlo.mlir"
+  if device == "cpu":
+    configurations = work / "configured.mlir"
+    subprocess.run(
+      [
+        binaries.find_tool("iree-compile"),
+        input_path,
+        *(flag for flag in flags if not flag.startswith("--compile-to=")),
+        "--compile-to=executable-configurations",
+        f"--iree-hal-dump-executable-sources-to={sources}",
+        f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}",
+        "-o",
+        configurations,
+      ],
+      check=True,
+    )
+    configurations.write_text(fill_small_tiles(configurations.read_text()))
+    input_path = configurations
+    flags = (*flags, "--compile-from=executable-configurations")
   subprocess.run(
     [
       binaries.find_tool("iree-compile"),
-      work / "stablehlo.mlir",
+      input_path,
       *flags,
       f"--iree-hal-dump-executable-sources-to={sources}",
       *([f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}"] if device == "cpu" else []),
