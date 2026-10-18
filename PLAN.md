@@ -67,8 +67,8 @@ Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tole
   schema and emits an ARC Objective-C host with cached pipelines, shared staging, a residency set,
   one encoder per queue execution and blocking completion. All 18 Metal tests pass with API
   validation; CPU remains 16.1 / 58.4 / 200.1 µs. Clear batch wins start at 48 for N=12 and 12 for
-  N=50, reaching 4.47× / 6.34× at 128. notes/metal.md records the full table. The requested Fable
-  5.1 high-effort review could not run because the Claude API rate limit was reached.
+  N=50, reaching 4.47× / 6.34× at 128. notes/metal.md records the full table. Fable 5.1 at high
+  effort approved the change after the rate-limited review resumed; no actionable findings.
 - [x] G1c. Metal uses Safe math, with regression coverage for nonfinite values and signed zero.
   Batch-128 latency rose by less than 1%. Documented IREE's f32 trig range limit; float64 promotion
   fixes CPU accuracy but costs about 7× on an elementwise probe. notes/metal.md has measurements.
@@ -97,7 +97,8 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
   an eight-solve continuation loop takes 4.82 µs against direct Scaly's 4.59 µs, agrees with JAX
   to 2.8e-16; `/tmp/aotax-h1c/scaly_foreign.py`. Fable 5.1 high-effort review approved with no
   act-on findings. IREE 3.12's scalar-result loop crash is documented; vector statistics work.
-  Two small review notes addressed; local checks pass. Delta review blocked by Claude's rate limit.
+  Two small review notes addressed; local checks pass. Fable 5.1's resumed low-effort delta check
+  confirmed both fixes, with nothing open.
 - [x] H2. `ProgramWorkload` in the harness: chain_rollout, newton, gauss_newton, chain_qp and
   batched_newton, checked against `jax.jit` (exact iteration counts), timed natively and as XLA
   amortized inside one jitted loop. aotax beats XLA on the rollout (1.0-2.3×), Gauss-Newton

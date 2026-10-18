@@ -185,7 +185,8 @@ statistics in a vector avoids this compiler failure.
   IREE's internal integer indices keep their original width. Metal does not use Accelerate or
   support custom calls. Host control flow is preserved, but each loop iteration that submits work
   pays GPU submission and completion latency. Single small evaluations are much slower than the
-  CPU; batching can amortize that cost. See [Metal measurements](notes/metal.md).
+  CPU; batching can amortize that cost. A reported GPU error permanently fails the context;
+  destroy it and create a new one. See [Metal measurements](notes/metal.md).
 - The translator follows the pinned IREE compiler's executable application binary interface (ABI).
   Unsupported HAL operations or command-buffer patterns raise an error during compilation.
 - Custom calls support JAX's CPU `lapack_{s,d}getrf_ffi`, `lapack_{s,d}potrf_ffi` and

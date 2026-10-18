@@ -177,8 +177,27 @@ The CPU's known overlapping `dynamic_update_slice` example does not compile on M
 3.12: its read/write `hal.interface.binding.subspan` fails Metal legalization. The host fixes
 overlapping native HAL copies, but does not repair IREE's unsupported dispatch lowering.
 
-The requested cross-family review was launched with Claude Fable 5.1 at high effort, but failed
-with "Claude API rate limit reached. Try again later." No review verdict or delta check exists.
+Claude Fable 5.1 at high effort approved `84965c6` after the initially rate-limited review resumed.
+There were no actionable findings, so no code fixes or reviewer delta check were needed. The
+reviewer also exercised empty arrays, scalar integers, longer scans, data-dependent loops and
+three concurrent contexts with 300 changing-input calls each. Forty C create/call/destroy cycles
+reported zero leaks. Scan, in-place loop, self-copy and non-byte fill cases passed both API and
+shader validation.
+
+The review left these notes:
+
+- Device-error feedback could not be induced at run time, even with injected out-of-bounds stores.
+  The error path was checked by reading. A reported device error permanently fails the context;
+  later calls return that error, and `destroy` prints it again while waiting. The error policy
+  is unchanged.
+- IREE 3.12 emits neither `max_threads_per_threadgroup` nor `threadgroup_size_aligned`. Ignoring
+  them is safe for this pin; revisit pipeline descriptors when updating IREE if those fields appear.
+- This pin emits one pipeline per executable. A future executable with several exports would
+  compile its library source once per export; deduplication can wait until that case exists.
+- Every fill site owns an 8-byte seed buffer, even for byte fills. The N=12 batch-48 host has
+  21 such buffers. Keep the measured implementation; removing unused seeds is a later optimization.
+- Graceful failure before macOS 26 relies on weak imports and the availability guard. It was
+  checked by reading and could not be tested on this machine.
 
 ## G1c: math mode and trig range
 

@@ -36,6 +36,14 @@ def test_shared_math_broadcast(tmp_path):
   np.testing.assert_allclose(loaded(x + 0.125, w), f(x + 0.125, w), rtol=1e-12, atol=1e-12)
 
 
+def test_math_broadcast_preserves_dot_fusion(tmp_path):
+  def f(x, w):
+    return jnp.sin(x)[:, None] + w @ w
+
+  check(f, np.linspace(-2, 2, 8), np.arange(64.0).reshape(8, 8) / 64, tmp_path=tmp_path)
+  assert "stablehlo.optimization_barrier" not in (tmp_path / "iree/stablehlo.mlir").read_text()
+
+
 def test_pytrees_scalars_and_mixed_dtypes(tmp_path):
   def step(state, k, scale):
     x, v = state["x"], state["v"]
