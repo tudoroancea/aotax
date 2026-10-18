@@ -111,3 +111,18 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
 Review, F0, G0 and H0 start together; F1 follows F0; G1 follows G0; H1 and H2 follow H0. The
 reviewer only reads. F agents own `benchmarks/`; G and H spikes work outside the repository or in
 new modules until their design is settled.
+
+## Phase 3
+
+- [ ] I. Polynomial approximations opt-in: one `compile` flag, off by default. Off: libm for f64
+  `exp`, and an accurate path for float32 `sin`/`cos` and other functions IREE approximates. On:
+  aotax's polynomial `exp` and IREE's approximations.
+- [ ] J. Structured derivatives: a general utility that recognizes stage structure in a JAX program
+  (vmapped stages, sums of element functions over index windows, scans) and assembles sparse
+  Jacobians and Hessians from small local derivatives, falling back to asdex. Design spike first,
+  measured against asdex and Scaly on chain, race_cars, npmpc and unbumpercars.
+- [ ] K. Selective scalarization: Scaly emits scalar code for tiny arrays. Find how to make IREE (or
+  an aotax pre-pass) do the same, measured on chain, race_cars and npmpc at small sizes.
+
+I is independent. J and K start as spikes outside the repository; their implementations follow
+their design notes.
