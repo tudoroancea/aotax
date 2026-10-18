@@ -118,6 +118,7 @@ def unique(a):
 class Node:
   shape: tuple
   dtype: object
+  weak_type: bool = False
   arg: int | None = None
   value: object = None
   eq: object = None
@@ -134,16 +135,20 @@ class Graph:
   def __init__(self, closed, argnums):
     self.argnums = argnums
     self.routes = {}
-    self.inputs = [Node(v.aval.shape, v.aval.dtype, arg=i, dependent=i == argnums) for i, v in enumerate(closed.jaxpr.invars)]
+    self.inputs = [
+      Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, arg=i, dependent=i == argnums) for i, v in enumerate(closed.jaxpr.invars)
+    ]
     self.output = self.build(closed, self.inputs)[0]
 
   def build(self, closed, inputs):
     env = dict(zip(closed.jaxpr.invars, inputs))
-    env.update((v, Node(v.aval.shape, v.aval.dtype, value=np.asarray(x))) for v, x in zip(closed.jaxpr.constvars, closed.consts))
+    env.update(
+      (v, Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, value=np.asarray(x))) for v, x in zip(closed.jaxpr.constvars, closed.consts)
+    )
 
     def read(v):
       if isinstance(v, core.Literal):
-        return Node(v.aval.shape, v.aval.dtype, value=np.asarray(v.val))
+        return Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, value=np.asarray(v.val))
       return env[v]
 
     for e in closed.jaxpr.eqns:
@@ -154,7 +159,9 @@ class Graph:
         outs = self.build(e.params["jaxpr"], ins)
       else:
         dependent = any(n.dependent for n in ins)
-        outs = [Node(v.aval.shape, v.aval.dtype, eq=e, ins=ins, output=i, dependent=dependent) for i, v in enumerate(e.outvars)]
+        outs = [
+          Node(v.aval.shape, v.aval.dtype, weak_type=v.aval.weak_type, eq=e, ins=ins, output=i, dependent=dependent) for i, v in enumerate(e.outvars)
+        ]
       env.update(zip(e.outvars, outs))
     return [read(v) for v in closed.jaxpr.outvars]
 
@@ -285,10 +292,14 @@ def routing(graph, n):
       raise Unsupported("gather: selecting a shared computed map needs shared-map extraction")
     index = graph.constant(n.ins[1])
     with jax.ensure_compile_time_eval():
-      out = np.asarray(n.eq.primitive.bind(a[0], index, **p))
+      out = np.asarray(n.eq.primitive.bind(a[0], index, **dict(p, fill_value=-1)))
+    if p["mode"] == jax.lax.GatherScatterMode.PROMISE_IN_BOUNDS:
+      bounds = np.array([n.ins[0].shape[d] - p["slice_sizes"][d] for d in p["dimension_numbers"].start_index_map])
+      if np.any(index < 0) or np.any(index > bounds):
+        raise Unsupported("gather: out-of-bounds promise_in_bounds indices violate the indexing promise")
   else:
     raise Unsupported(f"{name}: unsupported index routing")
-  if np.any(out < 0) or np.any(out >= offsets[-1]):
+  if (name != "gather" and np.any(out < 0)) or np.any(out >= offsets[-1]):
     raise Unsupported(f"{name}: out-of-bounds fill is unsupported")
   graph.routes[n] = out.reshape(-1), offsets
   return graph.routes[n]
@@ -303,6 +314,7 @@ class Extract:
     self.ops = []
     self.leaves = []
     self.cache = {}
+    self.depth = 0
 
   def op(self, fn, args, name="gather"):
     i = len(self.ops)
@@ -329,7 +341,13 @@ class Extract:
     inv = same(np.stack([np.searchsorted(a, b) for a, b in zip(ids, requested)]))
     key = (id(n), ids[0].tobytes(), ids.strides[0], None if ids.strides[0] == 0 else ids.tobytes())
     if key not in self.cache:
-      self.cache[key] = self.build(n, ids)
+      self.depth += 1
+      if self.depth > 128:
+        raise Unsupported(f"{n.eq.primitive.name if n.eq else 'input'}: local graph depth exceeds construction budget 128")
+      try:
+        self.cache[key] = self.build(n, ids)
+      finally:
+        self.depth -= 1
     result = self.cache[key]
     if len(inv) == ids.shape[1] and np.array_equal(inv, np.arange(len(inv))):
       return result
@@ -340,7 +358,7 @@ class Extract:
       value = n.value.reshape(-1)[ids]
       same(value)
       v = value[0]
-      return self.op(lambda v=v: jnp.asarray(v), (), "const")
+      return self.op(lambda v=v: jax.lax.convert_element_type_p.bind(v, new_dtype=n.dtype, weak_type=n.weak_type, sharding=None), (), "const")
     if n.arg is not None:
       self.leaves.append((len(self.ops), n.arg, ids))
       return self.op(None, (), "input")
@@ -383,13 +401,16 @@ class Extract:
     name = n.eq.primitive.name
     out, offsets = routing(self.graph, n)
     mapped = out[ids]
-    sources = np.searchsorted(offsets[1:], mapped, side="right")
+    sources = np.where(mapped < 0, -1, np.searchsorted(offsets[1:], mapped, side="right"))
     pattern = same(sources)
     parts = []
     order = []
     for i in np.unique(pattern):
       positions = np.flatnonzero(pattern == i)
-      parts.append(self.demand(n.ins[i], mapped[:, positions] - offsets[i]))
+      if i < 0:
+        parts.append(self.op(lambda count=positions.size: jnp.full(count, n.eq.params["fill_value"], dtype=n.dtype), (), "gather fill"))
+      else:
+        parts.append(self.demand(n.ins[i], mapped[:, positions] - offsets[i]))
       order.extend(positions)
     perm = np.argsort(order)
     if len(parts) == 1 and np.array_equal(perm, np.arange(len(perm))):
@@ -496,7 +517,7 @@ class Extract:
     return fn, inputs, params
 
 
-def terms(graph, hessian):
+def terms(graph):
   """Distribute only linear outer operations; nonlinear reductions remain intact."""
   result = []
 
@@ -509,7 +530,7 @@ def terms(graph, hessian):
       mapped = mapping[ids]
       sources = np.searchsorted(offsets[1:], mapped, side="right")
       for i in np.unique(sources):
-        keep = sources == i
+        keep = (sources == i) & (mapped >= 0)
         walk(n.ins[i], mapped[keep] - offsets[i], rows[keep], tuple((a, ix[keep], inverse) for a, ix, inverse in factors), sign)
     elif name in {"add", "sub", "neg"}:
       for i, a in enumerate(n.ins):
@@ -557,7 +578,7 @@ def program(ex, term, indices):
 
 def extract(f, specs, argnums, hessian):
   graph = Graph(jax.make_jaxpr(f)(*specs), argnums)
-  roots = terms(graph, hessian)
+  roots = terms(graph)
   groups = []
   pending = [(i, np.arange(len(term[1]))) for i, term in enumerate(roots)]
   while pending:

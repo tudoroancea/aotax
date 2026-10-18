@@ -39,12 +39,22 @@ def scalarize(fn, *specs):
       if n.arg is not None:
         return args[n.arg]
       if n.value is not None:
-        return np.asarray(n.value, dtype=object)
+        out = np.empty(n.shape, dtype=object)
+        with jax.ensure_compile_time_eval():
+          value = jax.lax.convert_element_type_p.bind(n.value, new_dtype=n.dtype, weak_type=True, sharding=None) if n.weak_type else n.value
+          for index in np.ndindex(n.shape):
+            out[index] = value[index]
+        return out
       a = [read(v) for v in n.ins]
       e, p = n.eq, n.eq.params
       name = e.primitive.name
       if name in ROUTING:
-        out = np.concatenate([x.reshape(-1) for x in a])[routing(graph, n)[0]].reshape(n.shape)
+        mapping = routing(graph, n)[0]
+        flat = np.concatenate([x.reshape(-1) for x in a])
+        if np.any(mapping < 0):
+          flat = np.concatenate([flat, obj(np.asarray(p["fill_value"], dtype=n.dtype)[()]).reshape(-1)])
+          mapping = np.where(mapping < 0, len(flat) - 1, mapping)
+        out = flat[mapping].reshape(n.shape)
       elif name == "reduce_sum":
         out = a[0].sum(axis=p["axes"])
       elif name == "dot_general":
@@ -58,7 +68,7 @@ def scalarize(fn, *specs):
           vals = [v[idx] for v in arrays]
           if not any(isinstance(v, Tracer) for v in vals):
             with jax.ensure_compile_time_eval():
-              out[idx] = np.asarray(e.primitive.bind(*[np.asarray(v) for v in vals], **p)).item()
+              out[idx] = e.primitive.bind(*vals, **p)
           else:
             out[idx] = Graph.custom(e)(*vals) if name == "custom_jvp_call" else e.primitive.bind(*vals, **p)
       cache[n] = obj(out)
@@ -80,11 +90,10 @@ def differentiate(fn, specs, hessian, matrix, outputs):
     pattern = _asdex(fn, specs, 0, hessian)
     r, c = pattern.rows, pattern.cols
     # A zero derivative column can still supply a runtime primal coefficient.
-    indices = np.arange(width)
     array_derivative = (jax.hessian if hessian else (jax.jacfwd if width <= outputs else jax.jacrev))(fn)
 
     def values(x, *p):
-      return array_derivative(x[indices], *p)[r, c]
+      return array_derivative(x, *p)[r, c]
 
   else:
     sf = scalarize(fn, *specs)

@@ -240,10 +240,17 @@ output and return its lower triangle. Jacobians flatten one array output and the
 in row-major order. The frozen result contains `values`, immutable sorted unique `rows` and `cols`,
 `shape`, and a readable `report`. Structural entries remain present when runtime values are zero.
 The contract covers finite derivatives and aotax's documented floating-point behavior.
+At masked nonsmooth points, derivatives follow JAX's reverse-mode rules and may be NaN
+where `jax.jacfwd` gives a finite value.
 
 `method="asdex"` uses structural detection and coloring with direct sparse recovery.
 `method="auto"` extracts local programs from the primal function and otherwise uses asdex,
-with the reason in the report. Outputs that share nonlinear work are grouped before
+with the reason in the report. The asdex path rejects statically out-of-bounds gather and
+scatter indices because asdex 0.5.2 can omit entries for these operations. Structured
+extraction supports clipped and filled gathers; out-of-bounds `promise_in_bounds` gathers
+raise because they violate the indexing promise. Unsupported asdex operations raise a
+`ValueError` naming the operation. While-loop Jacobians use forward mode.
+Outputs that share nonlinear work are grouped before
 Jacobian differentiation. Hessians differentiate weighted local primal sums with forward
 mode over reverse mode, then add their overlapping lower triangles. Nonlinear functions of
 sums remain intact. Duplicate input coordinates are deduplicated before differentiation.
@@ -255,7 +262,7 @@ reverse mode otherwise. Matrix products retain their contractions; shared parame
 `method="structured"` raises when extraction exceeds its supported rules or construction budget.
 
 Selection uses graph properties, without timing kernels: local programs have at most 128
-selected inputs and 512 array operations. Non-matrix Hessians exceeding both width 8 and
+selected inputs, 512 array operations and a backward-demand depth of 128. Non-matrix Hessians exceeding both width 8 and
 128 operations use asdex because scalar second derivatives grow too large. Wide Jacobian
 neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
 maps selected by gathers, general control flow and non-pointwise custom rules also fall back.
