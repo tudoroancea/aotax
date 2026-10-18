@@ -83,6 +83,8 @@ def lower_aotax(workload: Workload, size: int, out: Path, inputs: Inputs) -> Ker
   function, rows, cols = workload.aotax(size)
   specs = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in inputs.values()]
   library = aotax.compile(function, *specs, out=out, name="generated")
+  if len(library.out_avals) != 1 or library.out_avals[0].shape != (rows.size,) or library.out_avals[0].dtype != np.float64:
+    raise ValueError(f"{workload.name}: expected one float64 output of shape ({rows.size},), got {library.out_avals}")
   args = ", ".join([*(f"g_inputs[{i}]" for i in range(len(inputs))), "out"])
   adapter = (CPP / "aotax.c").read_text().replace("CALL_ARGS", args)
   (out / "adapter.c").write_text(adapter)
@@ -105,6 +107,10 @@ def write_inputs(directory: Path, workload: Workload, size: int, inputs: Inputs)
 
 def build(kernel: Kernel, workload: Workload, inputs: Inputs, reference: np.ndarray, directory: Path) -> Path:
   """Compile the adapter and shared correctness/timing binary."""
+  if kernel.rows.ndim != 1 or kernel.cols.shape != kernel.rows.shape:
+    raise ValueError(f"{workload.name}: rows and cols must be one-dimensional arrays of the same length")
+  if np.unique(np.stack([kernel.rows, kernel.cols]), axis=1).shape[1] != kernel.rows.size:
+    raise ValueError(f"{workload.name}: duplicate sparse coordinates")
   out = kernel.dir / "bin"
   out.mkdir()
   (out / "layout.h").write_text(
