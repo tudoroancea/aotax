@@ -13,6 +13,8 @@
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
 - `src/aotax/math.py`: preserves accurate elementary functions through JAX/IREE lowering, optionally
   expands f64 `exp`, and separates broadcasted libm results in programs without dot operations.
+- `src/aotax/sparse.py`: sparse Hessians and Jacobians; `_sparse.py` extracts and assembles local
+  primal programs, `_sparse_scalar.py` specializes small local derivatives, asdex is the fallback.
 - `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
 - `benchmarks/`: Scaly's sparse derivative workloads, timed against Scaly's generated C, and complete
   JAX programs, timed against XLA; workloads live in `benchmarks/workloads/` (`benchmarks/README.md`).
@@ -64,6 +66,10 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Metal's accurate elementary functions run through synchronized host libm adapters on shared
   buffers. Opt-in keeps IREE's GPU math. Both use `MTLMathModeSafe`; native functions use Precise
   by default and Fast with opt-in. Safe and the native function set are independent options.
+
+- Sparse extraction relies on JAX internals: `jax.core.eval_jaxpr` and `Tracer`,
+  `jax.extend.core.Literal`, jaxpr and primitive layouts, `convert_element_type` weak-type flags and
+  custom-JVP `jvp_jaxpr_fun.call_wrapped`. Rerun tests/test_sparse*.py on JAX upgrades.
 
 ## Measuring
 
