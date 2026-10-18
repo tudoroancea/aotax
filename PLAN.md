@@ -45,7 +45,9 @@ Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tole
 - [x] G0. Spike: notes/metal.md. A direct Objective-C host runs IREE's MSL kernels, 1.2-2×
   faster than IREE's Metal runtime. No single evaluation wins on the GPU (one tiny dispatch costs
   ~110 µs); batches do, from ~64 npmpc Hessians at N=12 or ~16 at N=50 (3.4× and 5.4× at 128).
-- [ ] G1a. Find and cut the ~100 µs gap between an empty command buffer and one tiny dispatch.
+- [x] G1a. The floor is driver scheduling and completion latency (GPU work is 7.7 of 91 µs). One
+  compute encoder (Metal 4: native copies and fills) halves the N=12 Hessian to ~330 µs and moves
+  the crossover to ~48 Hessians at N=12 and ~12 at N=50. notes/metal.md has the design decision.
 - [ ] G1b. After H1a+b lands: `aotax.compile(..., device="metal")`, with the
   same C API, generated from the same HAL translation (dispatches encoded into one command buffer,
   barriers as memory barriers, transients as shared buffers).

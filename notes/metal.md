@@ -65,3 +65,38 @@ the CPU path as the default. Stage caller arrays through shared buffers at first
 memory with `newBufferWithBytesNoCopy` requires page alignment. Estimated 500 to 900 lines with
 reuse of the HAL translation, which needs buffer-plus-offset values and dependency-preserving
 command emission.
+
+## G1a: where the per-call floor goes
+
+Scripts and raw data were written to `/tmp/aotax-metal-floor` and are not kept in the repository.
+
+A warmed tiny dispatch took 91 µs, of which the GPU executed 7.7 µs: 5 µs to create, encode and
+commit, about 40 µs of driver scheduling before the GPU starts (Metal's `kernelStartTime` and
+`kernelEndTime` describe that scheduling, `GPUStartTime` and `GPUEndTime` the execution), and 36 µs
+from the GPU's end to the CPU's return. A cold first call costs 3 to 4 ms; about 30 warm-up calls
+remove it. A GPU kept busy by other work lowers the floor to about 41 µs, but a keep-alive is not
+worth shipping.
+
+What a host controls, measured per call on the N=12 Hessian (wall time, with staging):
+
+| Host design | µs |
+|---|---:|
+| G0: compute encoder plus blit encoders for copies and fills | ~600 |
+| Copies and fills as compute work in one serial encoder | 346 |
+| Metal 4, whose compute encoder copies and fills natively | 328 |
+| Metal 4 with the whole call pre-encoded in an indirect command buffer | 326 to 352 |
+
+Encoder switches were the main cost: encoding the N=12 call fell from about 139 µs to 24 µs with
+one encoder, and to 5-10 µs pre-encoded. Spinning on a shared event instead of blocking saves 13 to
+20 µs but occupies a CPU core. Private storage, pipeline hints, unretained command buffers,
+concurrent encoders and untracked resources made no consistent difference. Metal's API validation
+roughly doubles the latency and shader validation triples it.
+
+With the best configuration the batch crossover moves to about 48 Hessians at N=12 (2.4× at 64,
+5.5× at 128) and about 12 at N=50 (3.0× at 32, 7.2× at 128). Single evaluations stay 30× slower than
+the CPU at N=12 and 4× slower at N=200.
+
+Decision for G1b: Metal 4 (macOS 26 or later), one queue and reusable command-buffer object per
+context, context-owned shared buffers, cached pipelines, argument tables and a residency set,
+dispatches and native copies and fills in one compute encoder with the HAL program's barriers, and a
+blocking wait on a shared event. Pre-encoding the whole call is a later option.
