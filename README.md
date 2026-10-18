@@ -74,7 +74,8 @@ keep IREE's dispatch code. Other platforms use IREE for all dispatches.
 
 `{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
 Constants are embedded as aligned static data; any constant preparation runs at creation. The host
-allocates no heap memory during calls. It flushes subnormal values to zero during execution, as IREE does,
+allocates no heap memory during calls; Accelerate may allocate internally.
+It flushes subnormal values to zero during execution, as IREE does,
 and restores the caller's floating-point mode afterward. Inputs bind directly to the caller's arrays
 when the HAL program never writes them. Outputs bind directly when the HAL program gives them
 a separate buffer. Results that share storage with inputs, constants, or
@@ -111,7 +112,7 @@ Four compiler settings matter:
   `lapack_{s,d}trsm_ffi` targets on macOS. These cover ordinary `jnp.linalg.solve`, Cholesky,
   triangular solves and SciPy-style LU and Cholesky solves. Other targets, user foreign calls,
   and LAPACK calls on other platforms raise an error during compilation. Adapters require static,
-  nonzero matrix and batch dimensions; JAX may eliminate empty calls before export.
+  nonzero matrix and batch dimensions.
 - Tested on macOS on Apple silicon. The Linux archive/link path is present but untested.
 
 ## Benchmarks

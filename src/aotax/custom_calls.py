@@ -125,6 +125,12 @@ def _specialize(op):
     require(b.shape[-2 if config["side"] == 76 else -1] == n, "incompatible triangular solve dimensions")
     expected = (b,)
   require(results == expected, "result shapes or dtypes differ from the LAPACK contract")
+  for key, tensors in (("operand_layouts", inputs), ("result_layouts", results)):
+    require(key in op.attributes and len(op.attributes[key]) == len(tensors), f"missing or incompatible {key}")
+    for layout, t in zip(op.attributes[key], tensors, strict=True):
+      rank = len(t.shape)
+      expected = (rank - 2, rank - 1, *reversed(range(rank - 2))) if t.dtype == dtype else tuple(reversed(range(rank)))
+      require(isinstance(layout, ir.DenseIntElementsAttr) and tuple(layout) == expected, f"unsupported {key}: expected {expected}")
   attributes = tuple((key, str(op.attributes[key])) for key in op.attributes)
   return Call(target, inputs, results, tuple(sorted(config.items())), attributes)
 

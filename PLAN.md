@@ -87,8 +87,17 @@ H1c remains separate. This task leaves `benchmarks/` to the workload agents.
   adapters with context scratch, and share host allocation and loop slot selection.
 - [x] Test solves, factorizations, triangular options, batches, loops, ownership, numerical status,
   rejected signatures and native linking; document the supported calls.
-- [ ] Run the full checks and npmpc baseline, then measure the H0 solves and five smoke workloads.
-- [ ] Get one cross-family review, fix findings, check the delta and commit.
+- [x] Run the full checks and npmpc baseline, then measure the H0 solves and five smoke workloads.
+- [x] Get one cross-family review, fix findings, check the delta and commit.
 
 The host integration depends on the registry contract; tests and measurements follow integration.
 The independent workload agents can continue adding their modules throughout.
+
+Validation: 80 tests pass with one existing IREE overlap xfail; Ruff, formatting and ty pass.
+The npmpc benchmark checks pass at 16.4 / 59.6 / 202.5 microseconds. Final solve and smoke
+measurements are in `/tmp/aotax-h1/{solve,workload}_timings.json`.
+
+Review by Claude Opus 5.5, xhigh, at `713a52d`: changes needed. Fixed false input aliases,
+validated LAPACK layouts, and pinned empty-dimension rejection. Also shared adapter scratch
+and documented Accelerate's internal allocation. Claude Fable 5.1, low, checked only the delta
+through `2f9aa1b`: all findings and notes resolved. H1c remains open.

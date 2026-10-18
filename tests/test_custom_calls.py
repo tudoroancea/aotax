@@ -169,13 +169,10 @@ def test_caller_overlap_and_alignment(tmp_path, offset):
 
 
 @lapack
-@pytest.mark.parametrize("shape", [(0, 0), (2, 0, 0), (0, 3, 3)])
-def test_empty_solve(tmp_path, shape):
-  a, b = np.empty(shape), np.empty((*shape[:-1], 1))
-  try:
-    check(jnp.linalg.solve, a, b, tmp_path=tmp_path)
-  except ValueError as error:
-    assert "nonzero dimensions" in str(error)
+@pytest.mark.parametrize("shape,bshape", [((0, 0), (0, 1)), ((2, 0, 0), (2, 0, 1)), ((0, 3, 3), (0, 3, 1)), ((3, 3), (3, 0))])
+def test_empty_solve(tmp_path, shape, bshape):
+  with pytest.raises(ValueError, match="nonzero dimensions"):
+    aotax.compile(jnp.linalg.solve, np.empty(shape), np.empty(bshape), out=tmp_path, name="solve")
 
 
 def exported_solve():
@@ -197,11 +194,51 @@ def test_unknown_target_and_platform(monkeypatch):
     ("uplo = 76", "uplo = 99", "invalid uplo"),
     ("diag = 85", "other = 85", "backend configuration"),
     ("lapack_dgetrf_ffi", "lapack_sgetrf_ffi", "target dtype"),
+    ("dense<[0, 1]>", "dense<[1, 0]>", "unsupported operand_layouts"),
   ],
 )
 def test_bad_contract(old, new, message):
   with pytest.raises(ValueError, match=message):
     rewrite_custom_calls(exported_solve().replace(old, new))
+
+
+@lapack
+@pytest.mark.parametrize("old,new", [("[2, 3, 1, 0]", "[3, 2, 1, 0]"), ("[2, 1, 0]", "[1, 2, 0]"), ("[1, 0]", "[0, 1]")])
+def test_result_layouts(old, new):
+  a, b = np.broadcast_to(np.eye(4), (2, 3, 4, 4)), np.ones((2, 3, 4, 1))
+  text = jax.export.export(jax.jit(jnp.linalg.solve))(a, b).mlir_module()
+  lines = []
+  for line in text.splitlines():
+    before, marker, after = line.partition("result_layouts =")
+    lines.append(before + marker + after.replace(old, new))
+  with pytest.raises(ValueError, match="unsupported result_layouts"):
+    rewrite_custom_calls("\n".join(lines))
+
+
+@lapack
+def test_fresh_result_keeps_inputs_bound(tmp_path, monkeypatch):
+  from aotax.custom_calls import Call
+
+  def aligned(shape):
+    raw = np.empty(np.prod(shape) * 8 + 64, np.uint8)
+    return np.ndarray(shape, np.float64, buffer=raw, offset=-raw.ctypes.data % 64)
+
+  a, b = aligned((16, 16)), aligned((16, 16))
+  a[:] = np.random.default_rng(16).normal(size=a.shape) + 16 * np.eye(16)
+  b[:] = np.arange(256.0).reshape(b.shape)
+  adapter = Call.adapter
+
+  def checked(self, symbol):
+    text = adapter(self, symbol)
+    guard = f"  if ((uintptr_t)p0 != {a.ctypes.data} || (uintptr_t)p1 != {b.ctypes.data}) return 1;\n"
+    return text.replace("{\n", "{\n" + guard, 1)
+
+  monkeypatch.setattr(Call, "adapter", checked)
+
+  def update(a, b):
+    return jl.solve_triangular(a, b, lower=True).at[3].set(1.0)
+
+  check(update, a, b, tmp_path=tmp_path)
 
 
 @lapack

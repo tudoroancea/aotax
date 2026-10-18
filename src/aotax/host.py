@@ -76,6 +76,8 @@ class _Host:
     self.globals = {}
     self.functions = []
     self.custom_calls = {}
+    size = max((spec.scratch for spec in custom_calls.values()), default=0)
+    scratch = self.storage(size) + "[0]" if size else "NULL"
     for top in module.body.operations:
       op = top.operation
       if op.name == "util.global":
@@ -92,7 +94,7 @@ class _Host:
           spec = custom_calls[symbol]
           t = ir.FunctionType(op.attributes["function_type"].value)
           spec.validate_hal(t.inputs, t.results)
-          self.custom_calls[symbol] = (spec, self.storage(spec.scratch) + "[0]" if spec.scratch else "NULL")
+          self.custom_calls[symbol] = (spec, scratch if spec.scratch else "NULL")
           continue
         if op.name == "util.func" and op.attributes["sym_name"].value != "main":
           self.unsupported(op, "private functions require memoization to be disabled")
@@ -164,7 +166,7 @@ class _Host:
     aliases = []
     for o in ops:
       for r in o.results:
-        if str(r.type) in BUFFERS:
+        if str(r.type) in BUFFERS and o.name != "util.call":
           aliases.extend((r, v) for v in o.operands if str(v.type) in BUFFERS)
       if o.name in {"cf.br", "cf.cond_br"}:
         args = [list(o.operands)] if o.name == "cf.br" else segments(o)[1:]
