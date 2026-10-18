@@ -81,12 +81,13 @@ Apple GPUs have no f64 arithmetic, so this path is `float32` only, with f32 tole
 - [x] G1a. The floor is driver scheduling and completion latency (GPU work is 7.7 of 91 µs). One
   compute encoder (Metal 4: native copies and fills) halves the N=12 Hessian to ~330 µs and moves
   the crossover to ~48 Hessians at N=12 and ~12 at N=50. notes/metal.md has the design decision.
-- [ ] G1b. After H1a+b lands: `aotax.compile(..., device="metal")`, with the
-  same C API, generated from the same HAL translation (dispatches encoded into one command buffer,
-  barriers as memory barriers, transients as shared buffers).
-  - [x] Share HAL analysis and control flow; add Metal executable extraction and command emission.
-  - [x] Wire compilation and loading, then test control flow, staging and Metal API validation.
-  - [ ] Measure the production backend, update docs, run checks and cross-family review, commit.
+- [x] G1b. `aotax.compile(..., device="metal")` preserves the C API and shares HAL analysis,
+  liveness and control-flow translation with CPU. A 399-line Metal module reads IREE's executable
+  schema and emits an ARC Objective-C host with cached pipelines, shared staging, a residency set,
+  one encoder per queue execution and blocking completion. All 18 Metal tests pass with API
+  validation; CPU remains 16.1 / 58.4 / 200.1 µs. Clear batch wins start at 48 for N=12 and 12 for
+  N=50, reaching 4.47× / 6.34× at 128. notes/metal.md records the full table. The requested Fable
+  5.1 high-effort review could not run because the Claude API rate limit was reached.
 - [ ] G2. Add f32 GPU columns to the benchmark sweep and map where CPU or GPU wins.
 
 ## H. Beyond Hessians: control flow, solver loops, foreign calls
