@@ -14,7 +14,7 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 ## Review of phase 1
 
 - [x] Cross-family review of 1af8fad (Fable 5.1, xhigh), fixes, and delta check (Fable 5.1, low): all eight findings resolved.
-- [ ] Push the reviewed phase 1 fixes.
+- [x] Fix a silent input mix-up when `jax.export` drops an unused argument (checked by gpt-6-astra); push.
 
 ## F. Scaly's workloads
 
