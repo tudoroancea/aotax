@@ -272,6 +272,31 @@ def test_multiple_shared_maps_fall_back_with_reason():
   assert "fallback: shared-map extraction: multiple computed gather sources" in result.report
 
 
+@pytest.mark.parametrize("hessian", [False, True])
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_shared_map_dtype_conversion_falls_back(hessian, dtype):
+  pytest.importorskip("asdex")
+  target = np.float64 if dtype == np.float32 else np.float32
+
+  def f(x):
+    y = jnp.sin(x).astype(target)
+    return (y[np.array([0, 1, 2])] * y[np.array([1, 2, 0])]).sum()
+
+  x = np.linspace(0.1, 0.6, 4, dtype=dtype)
+  builder = sparse_hessian if hessian else sparse_jacobian
+  with pytest.raises(ValueError, match="shared map: mixed input/output floating dtypes"):
+    builder(f, x, method="structured")
+  result = builder(f, x)
+  reference = np.asarray((jax.hessian if hessian else jax.jacfwd)(f)(x)).reshape(result.shape)
+  got = np.zeros(result.shape)
+  values = jax.jit(result.values)(x)
+  got[result.rows, result.cols] = values
+  np.testing.assert_allclose(got, np.tril(reference) if hessian else reference, rtol=3e-7, atol=3e-7)
+  if hessian:
+    assert values.dtype == reference.dtype
+  assert "fallback: shared map: mixed input/output floating dtypes" in result.report
+
+
 @pytest.mark.parametrize("method", ["auto", "asdex"])
 def test_parameter_only_cond_hessian(method):
   pytest.importorskip("asdex")

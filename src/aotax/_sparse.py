@@ -768,6 +768,8 @@ def compose(graph, specs, source, hessian):
   width = specs[argnums].size
   if not np.issubdtype(source.dtype, np.floating):
     raise Unsupported("shared map: outputs must be real floating arrays")
+  if source.dtype != specs[argnums].dtype:
+    raise Unsupported("shared map: mixed input/output floating dtypes are unsupported")
   saved = replace(source)
   source.arg, source.eq, source.ins = len(specs), None, ()
   pending = [(term, np.arange(len(term[1]))) for term in terms(graph)]
@@ -820,9 +822,7 @@ def compose(graph, specs, source, hessian):
   inactive = np.setdiff1d(np.arange(source.size), active)
   order = np.argsort(np.r_[active, inactive])
   replacement = graph.build(
-    jax.make_jaxpr(lambda x, p: jnp.concatenate([x[width:].astype(spec.dtype), p.reshape(-1)[inactive]])[order].reshape(source.shape))(
-      lifted_specs[argnums], spec
-    ),
+    jax.make_jaxpr(lambda x, p: jnp.concatenate([x[width:], p.reshape(-1)[inactive]])[order].reshape(source.shape))(lifted_specs[argnums], spec),
     [selected, passive],
   )[0]
   source.__dict__.update(replacement.__dict__)

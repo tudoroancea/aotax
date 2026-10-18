@@ -270,7 +270,8 @@ Selection uses graph properties, without timing kernels: local programs have at 
 selected inputs, 512 array operations and a backward-demand depth of 128. Non-matrix Hessians exceeding both width 8 and
 128 operations use asdex because scalar second derivatives grow too large. Wide Jacobian
 neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
-maps with multiple computed gather sources, general control flow and non-pointwise custom rules also fall back.
+maps with multiple computed gather sources or a different floating dtype from the selected input,
+general control flow and non-pointwise custom rules also fall back.
 Shared-map derivatives and their composition each have a two-million-entry construction budget.
 
 ## Benchmarks
