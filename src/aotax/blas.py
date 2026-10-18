@@ -53,7 +53,6 @@ class Contraction:
   a: _View
   b: _View
   c: _View
-  accumulator: _View | None
   m: int
   n: int
   k: int
@@ -64,22 +63,13 @@ class Contraction:
   def emit(self):
     a, b, c = self.a, self.b, self.c
     guards = [f"!overlap({v.pointer()}, {v.extent}, {c.pointer()}, {c.extent})" for v in (a, b)]
-    if self.accumulator is not None and self.accumulator != c:
-      v = self.accumulator
-      guards.append(f"!overlap({v.pointer()}, {v.extent}, {c.pointer()}, {c.extent})")
     lines = []
     if self.batch > 1:
       lines.append(f"for (size_t batch = 0; batch < {self.batch}; ++batch) {{")
     batch = "batch" if self.batch > 1 else "0"
-    if self.accumulator is not None and self.accumulator != c:
-      v = self.accumulator
-      lines.append(f"for (size_t row = 0; row < {self.m}; ++row)")
-      lines.append(
-        f"  memcpy({c.pointer(batch)} + row * {c.strides[-2]}, {v.pointer(batch)} + row * {v.strides[-2]}, {self.n} * sizeof(*{c.pointer()}));"
-      )
     args = ["CblasRowMajor", *("CblasTrans" if t else "CblasNoTrans" for t in (self.transpose_a, self.transpose_b))]
     args += [str(self.m), str(self.n), str(self.k), "1", a.pointer(batch), str(a.strides[-2]), b.pointer(batch), str(b.strides[-2])]
-    args += [str(int(self.accumulator is not None)), c.pointer(batch), str(c.strides[-2])]
+    args += ["0", c.pointer(batch), str(c.strides[-2])]
     lines.append(f"cblas_{'d' if c.dtype == 'f64' else 's'}gemm({', '.join(args)});")
     if self.batch > 1:
       lines.append("}")
@@ -186,18 +176,14 @@ def _recognize(fn):
     _require(v.strides[-2] >= v.shape[-1] and (len(v.shape) == 2 or v.strides[0] >= v.shape[-2] * v.strides[-2]))
   _require(all(0 < n <= 2147483647 for n in (*sizes.values(), a.strides[-2], b.strides[-2], c.strides[-2])))
   accumulator = op.operands[2].owner.operation
-  if accumulator.name == "linalg.fill":
-    _require(accumulator.operands[0].owner.operation.name == "arith.constant")
-    _require(float(accumulator.operands[0].owner.operation.attributes["value"].value) == 0)
-    _require(accumulator.operands[1].owner.operation.name == "tensor.empty")
-    acc = None
-  else:
-    acc = loaded(op.operands[2], "acc")
-    _require(acc.shape == c.shape and acc.dtype == c.dtype)
+  _require(accumulator.name == "linalg.fill")
+  _require(accumulator.operands[0].owner.operation.name == "arith.constant")
+  _require(float(accumulator.operands[0].owner.operation.attributes["value"].value) == 0)
+  _require(accumulator.operands[1].owner.operation.name == "tensor.empty")
   loads = {v.owner.operation for v in op.operands if v.owner.operation.name == "iree_tensor_ext.dispatch.tensor.load"}
   _require({o for o in ops if o.name == "iree_tensor_ext.dispatch.tensor.load"} == loads)
-  _require(len([o for o in ops if o.name == "linalg.fill"]) == int(acc is None))
-  return Contraction(a, b, c, acc, sizes[md], sizes[nd], sizes[kd], sizes.get(0, 1) if batch_dims else 1, ad[-1] == md, bd[-1] == kd)
+  _require(len([o for o in ops if o.name == "linalg.fill"]) == 1)
+  return Contraction(a, b, c, sizes[md], sizes[nd], sizes[kd], sizes.get(0, 1) if batch_dims else 1, ad[-1] == md, bd[-1] == kd)
 
 
 def contractions(directory: Path) -> dict[str, Contraction]:

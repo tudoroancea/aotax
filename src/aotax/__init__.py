@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,7 @@ from jax.core import ShapedArray
 
 from aotax.blas import contractions
 from aotax.exp import expand_exp
-from aotax.host import host
+from aotax.host import binding_writes, host
 
 __all__ = ["Library", "compile"]
 
@@ -101,10 +102,9 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
 
   (work / "stablehlo.mlir").write_text(expand_exp(exported.mlir_module()))
   sources = work / "sources"
-  if sys.platform == "darwin":
-    sources.mkdir(exist_ok=True)
-    for path in sources.glob("*.mlir"):
-      path.unlink()
+  sources.mkdir(exist_ok=True)
+  for path in sources.glob("*.mlir"):
+    path.unlink()
   for path in (work / "library.o", work / "library.h"):
     path.unlink(missing_ok=True)
   subprocess.run(
@@ -112,7 +112,7 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
       binaries.find_tool("iree-compile"),
       work / "stablehlo.mlir",
       *IREE_FLAGS,
-      *([f"--iree-hal-dump-executable-sources-to={sources}"] if sys.platform == "darwin" else []),
+      f"--iree-hal-dump-executable-sources-to={sources}",
       f"--iree-llvmcpu-static-library-output-path={work / 'library.o'}",
       "-o",
       work / "hal.mlir",
@@ -122,7 +122,7 @@ def compile(fn: Callable[..., Any], *args: Any, out: str | Path, name: str | Non
   library.header.write_text(_header(library))
   queries = re.findall(r"(\w+_library_query)\(", (work / "library.h").read_text()) if (work / "library.h").exists() else []
   blas = contractions(sources) if sys.platform == "darwin" else {}
-  (work / "host.c").write_text(host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas))
+  (work / "host.c").write_text(host(library, (work / "hal.mlir").read_text(), queries, _signature(library), blas, binding_writes(sources)))
   cc = os.environ.get("CC", "cc")
   subprocess.run(
     [
@@ -171,7 +171,8 @@ def _header(lib: Library) -> str:
 // Arrays are contiguous and row-major:
 {chr(10).join(shapes)}
 // create and call return 0 on success; on failure they print an error to stderr and return 1.
-// Pointers need no special alignment. Align to 64 bytes to avoid staging copies.
+// Pointers need no special alignment. Read-only bindings aligned to 64 bytes avoid staging copies.
+// Inputs are copied before execution if the compiled program writes their bindings.
 // Inputs may alias outputs; outputs may overlap and are written in the order listed.
 // A context is not thread-safe, but separate contexts may be used concurrently.
 #pragma once
@@ -197,11 +198,11 @@ void {lib.name}_destroy({lib.name}_context* context);
 class _Loaded:
   def __init__(self, lib: Library):
     self._lib = lib
-    shared = lib.archive.with_suffix(".dylib" if sys.platform == "darwin" else ".so")
     prefix = "_" if sys.platform == "darwin" else ""
     keep = [f"-Wl,-u,{prefix}{lib.name}_{fn}" for fn in ("create", "call", "destroy")]
-    subprocess.run([os.environ.get("CC", "cc"), "-shared", "-o", shared, *keep, lib.archive, *SYSTEM_LIBS], check=True)
-    self._dll = ctypes.CDLL(str(shared))
+    with tempfile.NamedTemporaryFile(dir=lib.archive.parent, suffix=".dylib" if sys.platform == "darwin" else ".so") as shared:
+      subprocess.run([os.environ.get("CC", "cc"), "-shared", "-o", shared.name, *keep, lib.archive, *SYSTEM_LIBS], check=True)
+      self._dll = ctypes.CDLL(shared.name)
     self._call = getattr(self._dll, f"{lib.name}_call")
     self._call.argtypes = [ctypes.c_void_p] * (1 + len(lib.in_avals) + len(lib.out_avals))
     self._destroy = getattr(self._dll, f"{lib.name}_destroy")

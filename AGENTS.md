@@ -27,9 +27,10 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Allocation sizes must be compile-time constants; transients live in the context. Loop-carried
   allocations get a pool of (live buffers + 1) slots.
 - Flush-to-zero is set once per call, as IREE's runtime did per dispatch, and the caller's mode is
-  restored. The polynomial `exp` relies on it for results below the smallest normal.
-- Caller pointers bind directly when 64-byte aligned and not overlapping another argument;
-  otherwise they are staged through context buffers.
+  restored. The polynomial `exp` explicitly selects zero below the smallest normal to match IREE.
+- Input pointers bind directly when 64-byte aligned, not overlapping outputs, and never written
+  by the HAL program; otherwise they are staged through context buffers. Overlapping outputs are staged too.
+- IREE 3.12's `slow_memcpy` dispatch mishandles overlapping self-slices in `dynamic_update_slice`.
 
 ## Measuring
 

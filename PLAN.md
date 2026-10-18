@@ -13,7 +13,8 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
 
 ## Review of phase 1
 
-- [ ] Cross-family review of 1af8fad (Fable 5.1, xhigh), fixes, delta check, then push.
+- [x] Cross-family review of 1af8fad (Fable 5.1, xhigh), fixes, and delta check (Fable 5.1, low): all eight findings resolved.
+- [ ] Push the reviewed phase 1 fixes.
 
 ## F. Scaly's workloads
 

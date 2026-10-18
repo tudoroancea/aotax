@@ -1,6 +1,7 @@
 """Translate the pinned compiler's hardware abstraction layer (HAL) program into a synchronous C host."""
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,24 @@ passes: Any = mlir_passes
 
 
 BUFFERS = {"!hal.buffer", "!hal.buffer_view", "!util.buffer", "!hal.file"}
+
+
+def binding_writes(directory: Path) -> dict[str, list[bool]]:
+  result = {}
+
+  def walk(op):
+    if op.name == "hal.executable.export":
+      bindings = re.findall(r"#hal.pipeline.binding<([^>]+)>", str(op.attributes["layout"]))
+      result[op.attributes["sym_name"].value] = ["ReadOnly" not in b for b in bindings]
+    for region in op.regions:
+      for block in region.blocks:
+        for child in block.operations:
+          walk(child.operation)
+
+  with ir.Context():
+    for path in directory.glob("*.mlir"):
+      walk(ir.Module.parse(path.read_text()).operation)
+  return result
 
 
 def _type(t) -> str:
@@ -44,10 +63,12 @@ def _data(attr) -> bytes:
 
 
 class _Host:
-  def __init__(self, lib: Any, module, queries: list[str], blas):
+  def __init__(self, lib: Any, module, queries: list[str], blas, writes):
     self.lib = lib
     self.queries = queries
     self.blas = blas
+    self.writes = writes
+    self.written_inputs = set()
     self.fields = []
     self.data = []
     self.entries = {}
@@ -127,6 +148,34 @@ class _Host:
         groups.append(list(o.operands[start : start + size]))
         start += size
       return groups
+
+    origins = {v: {i} for i, v in enumerate(blocks[0].arguments)} if main else {}
+    aliases = []
+    for o in ops:
+      for r in o.results:
+        if str(r.type) in BUFFERS:
+          aliases.extend((r, v) for v in o.operands if str(v.type) in BUFFERS)
+      if o.name in {"cf.br", "cf.cond_br"}:
+        args = [list(o.operands)] if o.name == "cf.br" else segments(o)[1:]
+        for successor, values in zip(o.successors, args, strict=True):
+          aliases.extend((r, v) for r, v in zip(successor.arguments, values, strict=True) if str(r.type) in BUFFERS)
+      elif o.name == "util.global.load" and str(o.results[0].type) in BUFFERS:
+        aliases.extend(
+          (o.results[0], store.operands[0])
+          for store in ops
+          if store.name == "util.global.store" and store.attributes["global"] == o.attributes["global"]
+        )
+    changed = True
+    while changed:
+      changed = False
+      for r, v in aliases:
+        merged = origins.get(r, set()) | origins.get(v, set())
+        if merged != origins.get(r, set()):
+          origins[r] = merged
+          changed = True
+
+    def written(v):
+      self.written_inputs.update(origins.get(v, ()))
 
     # Recording and execution must stay in one block; SSA operands then keep their recorded values.
     commands = {}
@@ -216,31 +265,40 @@ class _Host:
               returned[buf] = returned.get(buf, 0) + 1
               direct[buf] = i if returned[buf] == 1 else None
 
-    def binding(v, offset, table):
+    def binding(v, offset, table, write=False):
       if str(v.type) == "index":
         if table is None:
           self.unsupported(fn, "indirect binding without a binding table")
         index = const(v, v.owner.operation if isinstance(v, ir.OpResult) else fn)
         buf, base, _ = table[index]
+        if write:
+          written(buf)
         return f"({val(buf)} + {val(base)} + {val(offset)})"
+      if write:
+        written(v)
       return f"({val(v)} + {val(offset)})"
 
     def dispatch(o, table):
       g = segments(o)
       executable, ordinal = val(g[1][0]), val(g[2][0])
       x, y, z = [val(g[i][0]) for i in (3, 4, 5)]
-      pointers = [binding(v, off, table) for v, off in zip(g[7], g[8], strict=True)]
+      lookup = g[2][0].owner.operation
+      if lookup.name != "hal.executable.lookup.function":
+        self.unsupported(o, "dispatch requires a known entry point")
+      entry = lookup.attributes["entry_point"].value[-1]
+      if entry not in self.writes:
+        self.unsupported(o, f"missing binding layout for {entry}")
+      pointers = [binding(v, off, table, write) for v, off, write in zip(g[7], g[8], self.writes[entry], strict=True)]
       emit("{")
       emit(f"  void* ptrs[] = {{{', '.join(pointers)}}};")
       emit(f"  const size_t lengths[] = {{{', '.join(val(v) for v in g[9])}}};")
       emit(f"  const uint32_t constants[] = {{{', '.join(val(v) for v in g[6]) or '0'}}};")
-      lookup = g[2][0].owner.operation
-      contraction = self.blas.get(lookup.attributes["entry_point"].value[-1]) if lookup.name == "hal.executable.lookup.function" else None
+      contraction = self.blas.get(entry)
       fallback = f"if (dispatch(c, {executable}, {ordinal}, {x}, {y}, {z}, constants, ptrs, lengths)) return 1;"
       if contraction is not None:
         guard, lines = contraction.emit()
-        for view in (contraction.a, contraction.b, contraction.accumulator):
-          if view is not None and view.data:
+        for view in (contraction.a, contraction.b):
+          if view.data:
             emit(f"  alignas(64) static const unsigned char {view.binding}[] = {{{','.join(map(str, view.data))}}};")
         emit(f"  if ({x} && {y} && {z}) {{")
         emit(f"    if ({guard}) {{")
@@ -257,9 +315,9 @@ class _Host:
       if o.name == "hal.command_buffer.dispatch":
         dispatch(o, table)
       elif o.name == "hal.command_buffer.copy_buffer":
-        emit(f"memcpy({binding(a[3], a[4], table)}, {binding(a[1], a[2], table)}, {val(a[5])});")
+        emit(f"memmove({binding(a[3], a[4], table, True)}, {binding(a[1], a[2], table)}, {val(a[5])});")
       elif o.name == "hal.command_buffer.fill_buffer":
-        emit(f"fill({binding(a[1], a[2], table)}, {val(a[3])}, {val(a[4])}, sizeof({_type(a[4].type)}));")
+        emit(f"fill({binding(a[1], a[2], table, True)}, {val(a[3])}, {val(a[4])}, sizeof({_type(a[4].type)}));")
       else:
         self.unsupported(o)
 
@@ -392,9 +450,11 @@ class _Host:
           assign(o, ["1", f"{a[4]} + {a[5]}"])
         elif n == "hal.ex.file.from_memory":
           assign(o, [f"{a[2]} + {a[3]}"])
-        elif n == "hal.device.queue.read":
-          emit(f"memcpy({a[6]} + {a[7]}, {a[4]} + {a[5]}, {a[8]});")
+        elif n in {"hal.device.queue.read", "hal.device.queue.copy"}:
+          written(o.operands[6])
+          emit(f"memmove({a[6]} + {a[7]}, {a[4]} + {a[5]}, {a[8]});")
         elif n == "hal.device.queue.fill":
+          written(o.operands[4])
           emit(f"fill({a[4]} + {a[5]}, {a[6]}, {a[7]}, sizeof({_type(o.operands[7].type)}));")
         elif n == "hal.buffer_view.buffer":
           assign(o, [a[0]])
@@ -428,7 +488,7 @@ class _Host:
     return f"static int run{number}({self.lib.name}_context* c{parameters}) {{\n" + "\n".join(declarations + code) + "\n}\n"
 
 
-def host(lib: Any, text: str, queries: list[str], signature: str, blas=None) -> str:
+def host(lib: Any, text: str, queries: list[str], signature: str, blas, writes) -> str:
   with ir.Context():
     module = ir.Module.parse(text)
     # CPU imports bind embedded memory directly; their allocation fallback is unreachable.
@@ -451,7 +511,7 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas=None) -> 
       op.results[0].replace_all_uses_with(imported.results[0])
     if imports:
       passes.PassManager.parse("builtin.module(canonicalize)").run(module.operation)
-    h = _Host(lib, module, queries, blas or {})
+    h = _Host(lib, module, queries, blas, writes)
     functions = [h.function(fn, i) for i, fn in enumerate(h.functions)]
   n = lib.name
   ins, outs = len(lib.in_avals), len(lib.out_avals)
@@ -479,7 +539,8 @@ def host(lib: Any, text: str, queries: list[str], signature: str, blas=None) -> 
   stages = []
   for i, storage in enumerate(stage_inputs):
     overlap = " || ".join(f"overlap(in{i}, {sizes[i]}, out{j}, {sizes[ins + j]})" for j in range(outs)) or "0"
-    stages.append(f"  if (((uintptr_t)in{i} & 63) || {overlap}) {{ memcpy({storage}[0], in{i}, {sizes[i]}); inputs[{i}] = {storage}[0]; }}")
+    copy = f"memcpy({storage}[0], in{i}, {sizes[i]}); inputs[{i}] = {storage}[0];"
+    stages.append(f"  {copy}" if i in h.written_inputs else f"  if (((uintptr_t)in{i} & 63) || {overlap}) {{ {copy} }}")
   for i, storage in enumerate(stage_outputs):
     overlap = " || ".join(f"overlap(out{i}, {sizes[ins + i]}, out{j}, {sizes[ins + j]})" for j in range(outs) if j != i) or "0"
     stages.append(f"  if (((uintptr_t)out{i} & 63) || {overlap}) outputs[{i}] = {storage}[0];")

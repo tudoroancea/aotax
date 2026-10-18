@@ -143,6 +143,14 @@ def test_multiple_contexts(tmp_path):
       np.testing.assert_allclose(result, compute(x))
 
 
+def test_reload_after_recompile(tmp_path):
+  x = np.arange(4.0)
+  first = aotax.compile(lambda x: x + 1, x, out=tmp_path, name="f").load()
+  second = aotax.compile(lambda x: x + 2, x, out=tmp_path, name="f").load()
+  np.testing.assert_array_equal(first(x), x + 1)
+  np.testing.assert_array_equal(second(x), x + 2)
+
+
 def test_no_dispatches(tmp_path):
   def identity(x):
     return x, x, x
@@ -176,9 +184,52 @@ def test_dynamic_indices(tmp_path):
     jax.tree.map(np.testing.assert_array_equal, got, want)
 
 
+@pytest.mark.parametrize(
+  "fn,args",
+  [
+    (lambda x: x.at[2:10].set(0.0), ()),
+    (lambda x: jnp.sum(x.at[2:10].set(0.0)), ()),
+    (lambda x, i: x.at[i].set(42.0), (np.int32(3),)),
+    (lambda x: x.at[3].set(42.0), ()),
+    (lambda x, y, i: jax.lax.dynamic_update_slice(x, y, (i,)), (np.arange(8.0) + 100, np.int32(3))),
+    (lambda x, i: x.at[i].multiply(2.0), (np.int32(3),)),
+    (lambda x, i: jnp.sin(x.at[i].set(1.0)), (np.int32(3),)),
+    (lambda x, y: x.at[2:10].set(y), (np.arange(8.0) + 100,)),
+    (lambda x: x.at[2:10].set(x[:8]), ()),
+    (lambda x: jax.lax.fori_loop(0, 5, lambda i, v: v.at[1:].set(v[:-1]), x), ()),
+    (lambda x: jax.lax.scan(lambda c, _: (c.at[1:].set(c[:-1]), None), x, None, length=3)[0], ()),
+  ],
+  ids=["fill", "fill_sum", "scatter", "static", "dynamic_update", "multiply", "sin_set", "queue_copy", "self_copy", "loop", "scan"],
+)
+def test_inputs_unchanged(tmp_path, fn, args):
+  raw = np.empty(16 * 8 + 64, np.uint8)
+  x = np.ndarray((16,), dtype=np.float64, buffer=raw, offset=-raw.ctypes.data % 64)
+  x[:] = np.arange(16.0)
+  args = (x, *args)
+  before = [np.array(a, copy=True) for a in args]
+  loaded = aotax.compile(fn, *args, out=tmp_path, name="update").load()
+  want = jax.jit(fn)(*args)
+  for _ in range(2):
+    np.testing.assert_allclose(loaded(*args), want, rtol=1e-12, atol=1e-12)
+    for a, b in zip(args, before, strict=True):
+      np.testing.assert_array_equal(a, b)
+
+
+@pytest.mark.xfail(strict=True, reason="IREE 3.12 slow_memcpy dispatch mishandles overlapping dynamic_update_slice")
+def test_overlapping_dynamic_update(tmp_path):
+  def update(x, i):
+    return jax.lax.dynamic_update_slice(x, jax.lax.dynamic_slice(x, (i,), (6,)), (i + 2,))
+
+  x = np.arange(16.0)
+  loaded = aotax.compile(update, x, np.int32(3), out=tmp_path).load()
+  got = loaded(x, np.int32(3))
+  np.testing.assert_array_equal(x, np.arange(16.0))
+  np.testing.assert_array_equal(got, jax.jit(update)(x, np.int32(3)))
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("transpose_a,transpose_b", [(False, False), (True, False), (False, True), (True, True)])
-def test_blas_matmul(tmp_path, dtype, transpose_a, transpose_b):
+def test_blas_matmul(tmp_path, monkeypatch, dtype, transpose_a, transpose_b):
   import sys
 
   rng = np.random.default_rng(4)
@@ -188,6 +239,15 @@ def test_blas_matmul(tmp_path, dtype, transpose_a, transpose_b):
   def matmul(a, b):
     return (a.T if transpose_a else a) @ (b.T if transpose_b else b)
 
+  if sys.platform == "darwin":
+    generate = aotax.host
+
+    def host(*args):
+      text = generate(*args)
+      assert "} else if (dispatch(" in text
+      return "\n".join("    } else return 1;" if "} else if (dispatch(" in line else line for line in text.splitlines())
+
+    monkeypatch.setattr(aotax, "host", host)
   check(matmul, a, b, tmp_path=tmp_path, rtol=1e-12 if dtype == np.float64 else 1e-5)
   host = (tmp_path / "iree" / "host.c").read_text()
   assert (f"cblas_{'d' if dtype == np.float64 else 's'}gemm(" in host) == (sys.platform == "darwin")
@@ -249,4 +309,7 @@ def test_exp_range_and_special_values(tmp_path):
   with np.errstate(over="ignore", under="ignore"):
     expected = np.exp(x)
   expected[expected < np.finfo(np.float64).tiny] = 0
-  np.testing.assert_allclose(loaded(x), expected, rtol=4 * np.finfo(np.float64).eps, atol=0)
+  got = loaded(x)
+  finite = np.isfinite(expected) & (expected != 0)
+  np.testing.assert_array_equal(got[~finite], expected[~finite])
+  assert np.all(np.abs(got[finite] - expected[finite]) <= 2 * np.spacing(expected[finite]))

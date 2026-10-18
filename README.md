@@ -62,12 +62,14 @@ keep IREE's dispatch code. Other platforms use IREE for all dispatches.
 `{name}_create` allocates aligned storage for transients, loop-carried buffers, and workgroup memory.
 Constants are embedded as aligned static data; any constant preparation runs at creation. The host
 allocates no heap memory during calls. It flushes subnormal values to zero during execution, as IREE does,
-and restores the caller's floating-point mode afterward. Inputs bind directly to the caller's arrays, and outputs do too when the
-HAL program gives them a separate buffer. Results that share storage with inputs, constants, or
+and restores the caller's floating-point mode afterward. Inputs bind directly to the caller's arrays
+when the HAL program never writes them. Outputs bind directly when the HAL program gives them
+a separate buffer. Results that share storage with inputs, constants, or
 other results need a copy.
 
-Pointers need no special alignment. A pointer aligned to 64 bytes avoids staging; aotax copies
-less-aligned arrays through context-owned buffers to meet the dispatch code's alignment assumptions.
+Pointers need no special alignment. A read-only binding aligned to 64 bytes avoids staging; aotax copies
+less-aligned arrays and inputs whose bindings the HAL program writes through context-owned buffers.
+This meets the dispatch code's alignment assumptions and preserves the caller's inputs.
 Inputs may overlap outputs, in which case the affected inputs are copied before execution. Outputs
 may overlap each other and are written in the order listed in the header.
 
