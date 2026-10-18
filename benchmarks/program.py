@@ -51,7 +51,8 @@ def build(workload: ProgramWorkload, size: str, out: Path) -> Path:
   loaded = library.load()
   check(workload, size, loaded(*inputs), want)
   varied = perturb(inputs, 1)
-  check(workload, size, loaded(*varied), reference(workload, size, varied))
+  varied_reference = reference(workload, size, varied)
+  check(workload, size, loaded(*varied), varied_reference)
   leaves, outputs = jax.tree.leaves(inputs), jax.tree.leaves(want)
   for value in (*leaves, *outputs):
     if value.dtype not in TYPES:
@@ -111,6 +112,7 @@ def build(workload: ProgramWorkload, size: str, out: Path) -> Path:
         "axes": workload.axes(size),
         "outputs": [{"shape": v.shape, "dtype": str(v.dtype)} for v in outputs],
         "integer_outputs": [v.tolist() for v in outputs if np.issubdtype(v.dtype, np.integer)],
+        "perturbed_integer_outputs": [v.tolist() for v in jax.tree.leaves(varied_reference) if np.issubdtype(v.dtype, np.integer)],
       },
       indent=2,
     )

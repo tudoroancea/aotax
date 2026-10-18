@@ -1,4 +1,4 @@
-# Sparse kernel benchmarks
+# CPU benchmarks
 
 Run all discovered workloads, or select names and sizes:
 
@@ -63,7 +63,8 @@ uv run --group bench benchmarks/bench.py --workloads chain_rollout,newton,gauss_
 uv run --group bench benchmarks/bench.py --workloads chain_rollout --sizes 3x12,5x50
 ```
 
-These modules export `ProgramWorkload` from `workload.py` alongside the sparse `Workload`.
+The programs compare native C with JAX's Accelerated Linear Algebra (XLA) CPU compiler.
+Modules export `ProgramWorkload` from `workload.py` alongside the sparse `Workload`.
 Its fields are `name`, named `sizes`, `axes(size) -> dict[str, int]`,
 `inputs(size) -> tuple` of positional arguments, `function(size) -> Callable`, and
 `tolerances(size) -> tuple[(rtol, atol), ...]` in JAX pytree leaf order. Arguments and
@@ -92,19 +93,22 @@ Compilation and warmup are excluded. The XLA loop calibrates its count toward
 and then a fresh Python process for the two JAX measurements. The best of each is
 reported, and `build/results.csv` retains all repetitions with backend names `aotax`,
 `xla`, `jax_python`. Sparse workloads retain their existing Scaly comparison and CSV rows.
-`build/<name>/N<size>/aotax/metadata.json` records size axes, output shapes and integer results.
+`build/<name>/N<size>/aotax/metadata.json` records size axes, output shapes and integer results
+for base and perturbed inputs. Check that counts agree when comparing convergence-dependent rows;
+they agree in all default Newton cases.
 
 | Program | Size axes and defaults | Timed work |
 |---|---|---|
-| `chain_rollout` | M x N: 3x12, 3x50, 3x200, 5x50, 10x50 | RK4 scan; final state and full trajectory |
+| `chain_rollout` | M x N: 3x12, 3x50, 3x200, 5x50, 10x50 | Fourth-order Runge-Kutta (RK4) scan; final state and full trajectory |
 | `newton` | n: 4, 8, 16, 32, 64 | Bratu Newton, residual infinity norm <= 1e-10, at most 20 iterations; solution, count and residual |
 | `gauss_newton` | observations x parameters x iterations: 16x3x8, 64x3x8, 64x5x12 | Exponential mixture fit, damped normal equations, Cholesky and triangular solves; parameters, residual and fixed count |
-| `chain_qp` | M x N x iterations: 3x4x15, 3x12x15, 5x12x15 | Condensed chain QP, fixed-step primal-dual method; primal, slacks, multipliers, residuals and count |
+| `chain_qp` | M x N x iterations: 3x4x15, 3x12x15, 5x12x15 | Condensed chain quadratic program (QP), fixed-step primal-dual method; primal, slacks, multipliers, residuals and count |
 | `batched_newton` | batch x n: 1x8, 4x8, 16x8, 64x8 | vmap of converging Newton; per-lane solutions, counts and residuals |
 
 The rollout and QP use `_chain.initial_state(M)` and `_chain.PARAMS`, including the
 canonical dt=0.2. Controls start at zero. QP construction differentiates the rollout
-and uses Scaly's chain stage/terminal weights and [-1, 1] control bounds. Construction
+and uses Scaly's chain weight constants and [-1, 1] control bounds. Stage costs divide
+by the selected horizon N; `_chain.stage_cost_jax` uses its fixed horizon of 40. Construction
 is outside timing; Q, c, G and h are runtime inputs. This is one dense condensed
 subproblem, not a complete nonlinear controller or a scalable stagewise solver.
 The fit has an odd parameter count, with amplitude/rate pairs and one offset. The
@@ -135,3 +139,16 @@ and relative tolerances of 1e-9. Its iteration count and primal residual are rep
 Scaly embeds Q at generation time; the JAX program accepts Q at runtime. This is a
 complete-solver comparison with different algorithms and specialization, not a direct
 compiler comparison. Both solutions must agree within `2e-6 + 1e-5 * abs(reference)`.
+
+For dynamic call counts after building a program:
+
+```sh
+uv run --group bench benchmarks/profile_program.py newton 32
+sample <benchmark-pid> 4
+```
+
+The counter script compiles a separate instrumented host into `profile.dylib`, leaving
+its benchmark archive unchanged. It writes `profile.json` with dynamic dispatch and
+foreign-call counts, the context struct size and integer outputs. The struct size
+excludes separately allocated dispatch local memory. Ignore Google Benchmark's
+`CPUInfo::CPUInfo()` startup when reading samples.

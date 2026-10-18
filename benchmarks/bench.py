@@ -1,7 +1,8 @@
-"""Time sparse workloads from Scaly and aotax in interleaved fresh processes."""
+"""Time sparse kernels and complete programs in interleaved fresh processes."""
 
 import argparse
 import csv
+import math
 import shutil
 from pathlib import Path
 
@@ -23,7 +24,26 @@ def main() -> None:
   if unknown := set(args.workloads) - workloads.keys():
     parser.error(f"unknown workloads {sorted(unknown)}; choose from {list(workloads)}")
   if args.reps < 1:
-    parser.error("reps and sizes must be positive")
+    parser.error("reps must be positive")
+  for name in args.workloads:
+    if args.sizes is not None:
+      try:
+        selected = workloads[name]
+        if isinstance(selected, ProgramWorkload):
+          for size in args.sizes:
+            selected.axes(size)
+        elif any(int(size) < 1 for size in args.sizes):
+          raise ValueError("sizes must be positive")
+      except ValueError as error:
+        parser.error(str(error))
+  seconds = 0.5
+  if any(isinstance(workloads[name], ProgramWorkload) for name in args.workloads):
+    try:
+      seconds = float(args.min_time.removesuffix("s"))
+    except ValueError:
+      parser.error("program --min-time must be seconds, for example 0.5s")
+    if not math.isfinite(seconds) or seconds <= 0:
+      parser.error("program --min-time must be positive seconds")
   build = harness.HERE / "build"
   binaries: dict[tuple[str, int | str, str], Path] = {}
   program_cases = {}
@@ -41,8 +61,6 @@ def main() -> None:
         program_cases[name, size] = workload
         continue
       size = int(raw_size)
-      if size < 1:
-        parser.error("sizes must be positive")
       directory = build / name / f"N{size}" / "inputs"
       inputs = workload.inputs(size)
       reference = harness.write_inputs(directory, workload, size, inputs)
@@ -62,7 +80,6 @@ def main() -> None:
       times[key].append(harness.time(binary, args.min_time))
       print(f"rep {rep + 1}/{args.reps} {key[0]} size={key[1]} {key[2]}: {times[key][-1]:.2f} us", flush=True)
       if (key[0], key[1]) in program_cases:
-        seconds = float(args.min_time.removesuffix("s"))
         for backend, value in program.time_jax(program_cases[key[0], str(key[1])], str(key[1]), seconds).items():
           times[key[0], key[1], backend].append(value)
 

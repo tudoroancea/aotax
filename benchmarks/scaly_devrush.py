@@ -1,4 +1,4 @@
-"""Study Scaly devrush's generated Newton and dense IPM without changing the installed Scaly."""
+"""Study Scaly devrush's Newton and dense interior-point solver without changing installed Scaly."""
 
 import argparse
 import ctypes
@@ -21,6 +21,8 @@ def prepare(source: Path, directory: Path, name: str, size: str):
   sys.path.insert(0, str(source / "src"))
   os.environ["SCALY_CACHE_DIR"] = str(directory / "cache")
   sc: Any = import_module("scaly")
+  if not Path(sc.__file__).resolve().is_relative_to(source.resolve()):
+    raise RuntimeError(f"expected archived Scaly under {source}, imported {sc.__file__}")
   write_module = import_module("scaly.codegen").write_module
 
   values = np.load(directory / "inputs.npz")
