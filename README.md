@@ -223,6 +223,27 @@ statistics in a vector avoids this compiler failure.
   during compilation. LAPACK adapters require static, nonzero matrix and batch dimensions.
 - Tested on macOS on Apple silicon. The Linux archive/link path is present but untested.
 
+## Sparse derivatives
+
+Install `aotax[sparse]` for sparse derivatives of plain JAX functions:
+
+```python
+from aotax.sparse import sparse_hessian, sparse_jacobian
+
+h = sparse_hessian(energy, x, parameters)
+lib = aotax.compile(h.values, x, parameters, out="build/hessian")
+```
+
+Both constructors take arrays or `jax.ShapeDtypeStruct`s and differentiate one real floating
+array selected by `argnums=0`. Other arguments remain runtime inputs. Hessians require a scalar
+output and return its lower triangle. Jacobians flatten one array output and the selected input
+in row-major order. The frozen result contains `values`, immutable sorted unique `rows` and `cols`,
+`shape`, and a readable `report`. Structural entries remain present when runtime values are zero.
+
+`method="asdex"` uses structural detection and coloring with direct sparse recovery.
+`method="auto"` uses proved local structure and otherwise falls back to asdex, with the reason
+in the report. `method="structured"` raises when extraction is unsupported.
+
 ## Benchmarks
 
 `benchmarks/` times two kinds of workloads on the CPU; `benchmarks/README.md` describes them and
@@ -235,10 +256,13 @@ uv run --group bench benchmarks/bench.py
 The derivative workloads come from [Scaly](https://github.com/PREDICT-EPFL/scaly)'s benchmark
 suite: the sparse Lagrangian Hessian (lower triangle) or constraint Jacobian of four model
 predictive control problems. Scaly compiles them with its own symbolic compiler; aotax compiles the
-same functions written in JAX and differentiated sparsely by [asdex](https://adrianhill.de/asdex/).
+same functions written in JAX through `aotax.sparse`. The `aotax` column uses
+[asdex](https://adrianhill.de/asdex/) and `aotax_structured` uses automatic local extraction with
+asdex fallback. Each library has a `sparse-report.txt` recording its method and construction time.
 Every entry is checked against a dense JAX derivative before timing. aotax CPU time divided by
-Scaly's on an Apple M4 Max, best of three processes. These historical measurements used the
-math approximations now enabled by `approximate_math=True`; the benchmark harness uses the accurate default:
+Scaly's on an Apple M4 Max, best of three processes. These historical measurements use the asdex
+baseline and the math approximations now enabled by `approximate_math=True`; new runs use the
+accurate default and also print the structured column:
 
 | Problem | Sizes | Hessian | Jacobian |
 |---|---|---|---|

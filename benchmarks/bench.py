@@ -10,7 +10,7 @@ import harness
 import program
 from workload import ProgramWorkload, discover
 
-BACKENDS = {"scaly": harness.lower_scaly, "aotax": harness.lower_aotax}
+BACKENDS = {"scaly": harness.lower_scaly, "aotax": harness.lower_aotax, "aotax_structured": harness.lower_structured}
 
 
 def main() -> None:
@@ -93,7 +93,7 @@ def main() -> None:
     if isinstance(workloads[name], ProgramWorkload):
       print(f"{'size':>12}{'aotax':>12}{'XLA loop':>12}{'JAX Python':>12}{'aot/XLA':>9}")
     else:
-      print(f"{'size':>5}{'scaly':>12}{'aotax':>12}{'ratio':>8}")
+      print(f"{'size':>5}{'scaly':>12}{'aotax':>12}{'structured':>12}{'ratio':>8}")
     for size in args.sizes or workloads[name].sizes:
       if isinstance(workloads[name], ProgramWorkload):
         size = str(size)
@@ -102,7 +102,8 @@ def main() -> None:
         continue
       size = int(size)
       scaly, aot = min(times[name, size, "scaly"]), min(times[name, size, "aotax"])
-      print(f"{size:>5}{scaly:>12.1f}{aot:>12.1f}{aot / scaly:>7.2f}x")
+      structured = min(times[name, size, "aotax_structured"])
+      print(f"{size:>5}{scaly:>12.1f}{aot:>12.1f}{structured:>12.1f}{aot / scaly:>7.2f}x")
 
 
 if __name__ == "__main__":

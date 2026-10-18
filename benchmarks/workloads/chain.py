@@ -5,9 +5,8 @@ Uses Scaly's synthetic sweep samples rather than optional harvested closed-loop 
 
 from functools import partial
 
-import asdex
 import numpy as np
-from workload import Inputs, SparseJax, Workload
+from workload import Inputs, Workload
 from workloads import _chain as problem
 
 
@@ -44,33 +43,15 @@ def scaly_jac(M: int):
   return fn, np.asarray(sparsity.rows), np.asarray(sparsity.cols)
 
 
-def aotax_lower(M: int) -> SparseJax:
-  fn = partial(problem.lagrangian_jax, M=M)
-  shapes = [np.zeros_like(value) for value in inputs(M).values()]
-  coloring = asdex.hessian_coloring(fn, *shapes, argnums=0)
-  compressed = asdex.compressed_hessian_from_coloring(fn, coloring)
-  rows, cols = np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
-  lower = np.flatnonzero(rows >= cols)
-
-  def values(z, p, lam_f, lam_g):
-    return asdex.decompress_data(compressed(z, p, lam_f, lam_g), coloring)[lower]
-
-  return values, rows[lower], cols[lower]
+def function(M: int):
+  return partial(problem.lagrangian_jax, M=M)
 
 
-def aotax_jac(M: int) -> SparseJax:
-  fn = partial(problem.constraints_jax, M=M)
-  shapes = [np.zeros_like(value) for value in jac_inputs(M).values()]
-  coloring = asdex.jacobian_coloring(fn, *shapes, argnums=0)
-  compressed = asdex.compressed_jacobian_from_coloring(fn, coloring)
-
-  def values(z, p):
-    return asdex.decompress_data(compressed(z, p), coloring)
-
-  return values, np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
+def jac_function(M: int):
+  return partial(problem.constraints_jax, M=M)
 
 
 WORKLOADS = (
-  Workload("chain", (3, 9, 17), inputs, reference, scaly_lower, aotax_lower),
-  Workload("chain_jac", (3, 9, 17), jac_inputs, jac_reference, scaly_jac, aotax_jac, lower_triangle=False),
+  Workload("chain", (3, 9, 17), inputs, reference, scaly_lower, function),
+  Workload("chain_jac", (3, 9, 17), jac_inputs, jac_reference, scaly_jac, jac_function, lower_triangle=False),
 )

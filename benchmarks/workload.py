@@ -13,7 +13,6 @@ import scaly as sc
 jax.config.update("jax_enable_x64", True)
 
 Inputs = dict[str, np.ndarray]
-SparseJax = tuple[Callable[..., Any], np.ndarray, np.ndarray]
 SparseScaly = tuple[sc.Function, np.ndarray, np.ndarray]
 
 
@@ -26,7 +25,7 @@ class Workload:
   inputs: Callable[[int], Inputs]
   reference: Callable[[int, Inputs], np.ndarray]
   scaly: Callable[[int], SparseScaly]
-  aotax: Callable[[int], SparseJax]
+  function: Callable[[int], Callable[..., Any]]
   lower_triangle: bool = True
 
 

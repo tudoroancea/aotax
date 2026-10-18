@@ -9,16 +9,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from workloads import _npmpc as problem
-from workloads.npmpc import asdex_lower
+from workloads.npmpc import function
 
 import aotax
+from aotax.sparse import sparse_hessian
 
 
 def cases():
   yield "tiny", lambda x: jnp.sin(x) * x + 2, [np.ones(1, np.float32)]
   for n, batches in [(12, [1, 2, 4, 8, 16, 32, 40, 48, 64, 96, 128]), (50, [1, 2, 4, 8, 10, 12, 16, 32, 64, 128]), (200, [])]:
-    fn, _, _ = asdex_lower(n)
     inputs = [x.astype(np.float32) for x in problem.sample_inputs(n)]
+    fn = sparse_hessian(function(n), *inputs, method="asdex").values
     yield f"N{n}_single", fn, inputs
     for batch in batches:
       mapped = jax.vmap(fn, in_axes=(0, None, 0))

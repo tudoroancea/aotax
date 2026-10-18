@@ -2,10 +2,9 @@
 
 from functools import partial
 
-import asdex
 import jax
 import numpy as np
-from workload import Inputs, SparseJax, Workload
+from workload import Inputs, Workload
 from workloads import _race_cars as problem
 
 
@@ -43,31 +42,15 @@ def scaly_jac(N: int):
   return fn, np.asarray(sparsity.rows), np.asarray(sparsity.cols)
 
 
-def asdex_lower(N: int) -> SparseJax:
-  lagrangian = partial(problem.lagrangian_jax, N=N)
-  coloring = asdex.hessian_coloring(lagrangian, *inputs(N).values(), argnums=0)
-  compressed = asdex.compressed_hessian_from_coloring(lagrangian, coloring)
-  rows, cols = np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
-  lower = np.flatnonzero(rows >= cols)
-
-  def values(z, p, lam_f, lam_g):
-    return asdex.decompress_data(compressed(z, p, lam_f, lam_g), coloring)[lower]
-
-  return values, rows[lower], cols[lower]
+def function(N: int):
+  return partial(problem.lagrangian_jax, N=N)
 
 
-def aotax_jac(N: int) -> SparseJax:
-  constraints = partial(problem.constraints_jax, N=N)
-  coloring = asdex.jacobian_coloring(constraints, *jac_inputs(N).values(), argnums=0)
-  compressed = asdex.compressed_jacobian_from_coloring(constraints, coloring)
-
-  def values(z, p):
-    return asdex.decompress_data(compressed(z, p), coloring)
-
-  return values, np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
+def jac_function(N: int):
+  return partial(problem.constraints_jax, N=N)
 
 
 WORKLOADS = (
-  Workload("race_cars", (5, 40, 500), inputs, reference, scaly_lower, asdex_lower),
-  Workload("race_cars_jac", (5, 40, 500), jac_inputs, jac_reference, scaly_jac, aotax_jac, lower_triangle=False),
+  Workload("race_cars", (5, 40, 500), inputs, reference, scaly_lower, function),
+  Workload("race_cars_jac", (5, 40, 500), jac_inputs, jac_reference, scaly_jac, jac_function, lower_triangle=False),
 )

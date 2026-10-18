@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time as clock
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -18,6 +19,7 @@ from scaly.codegen.toolchain import find_c_compiler, native_recipe
 from workload import Inputs, Workload
 
 import aotax
+from aotax.sparse import sparse_hessian, sparse_jacobian
 
 HERE = Path(__file__).parent
 CPP = HERE / "cpp"
@@ -78,17 +80,25 @@ def lower_scaly(workload: Workload, size: int, out: Path, inputs: Inputs) -> Ker
   return Kernel(out, rows, cols, adapter="adapter.c", sources=(out / module.source_name,))
 
 
-def lower_aotax(workload: Workload, size: int, out: Path, inputs: Inputs) -> Kernel:
+def lower_aotax(workload: Workload, size: int, out: Path, inputs: Inputs, *, method: str = "asdex") -> Kernel:
   """Compile the workload's sparse JAX kernel."""
-  function, rows, cols = workload.aotax(size)
   specs = [jax.ShapeDtypeStruct(value.shape, value.dtype) for value in inputs.values()]
-  library = aotax.compile(function, *specs, out=out, name="generated")
+  start = clock.perf_counter()
+  derivative = (sparse_hessian if workload.lower_triangle else sparse_jacobian)(workload.function(size), *specs, method=method)
+  seconds = clock.perf_counter() - start
+  rows, cols = derivative.rows, derivative.cols
+  (out / "sparse-report.txt").write_text(f"construction: {seconds:.6f} seconds\n{derivative.report}\n")
+  library = aotax.compile(derivative.values, *specs, out=out, name="generated")
   if len(library.out_avals) != 1 or library.out_avals[0].shape != (rows.size,) or library.out_avals[0].dtype != np.float64:
     raise ValueError(f"{workload.name}: expected one float64 output of shape ({rows.size},), got {library.out_avals}")
   args = ", ".join([*(f"g_inputs[{i}]" for i in range(len(inputs))), "out"])
   adapter = (CPP / "aotax.c").read_text().replace("CALL_ARGS", args)
   (out / "adapter.c").write_text(adapter)
   return Kernel(out, rows, cols, adapter="adapter.c", libs=(library.archive, *aotax.SYSTEM_LIBS))
+
+
+def lower_structured(workload: Workload, size: int, out: Path, inputs: Inputs) -> Kernel:
+  return lower_aotax(workload, size, out, inputs, method="auto")
 
 
 def write_inputs(directory: Path, workload: Workload, size: int, inputs: Inputs) -> np.ndarray:

@@ -10,6 +10,9 @@ uv run --group bench benchmarks/bench.py --workloads npmpc,npmpc_jac --sizes 12,
 Each binary checks its output against an independent dense reference before timing.
 Hessians check the lower triangle; Jacobians check every matrix entry. Stored values
 must agree within `1e-9 + 1e-9 * abs(reference)`, and missing entries must be zero.
+The `scaly` column uses Scaly's symbolic compiler. `aotax` uses `aotax.sparse` with
+`method="asdex"`; `aotax_structured` uses `method="auto"`. Each aotax library has a
+`sparse-report.txt` with its extraction/fallback report and Python construction time.
 Results use the best CPU time across interleaved fresh processes. Generated files live
 in `build/<workload>/N<size>/<backend>/`; `build/results.csv` includes every repetition.
 
@@ -28,9 +31,9 @@ or command-line edits are needed. Put helpers in a file starting with `_`.
   two-dimensional matrix, independent of asdex's sparsity detection.
 - `scaly(size: int) -> tuple[sc.Function, np.ndarray, np.ndarray]` returns a function
   with one sparse output, its row indices and its column indices.
-- `aotax(size: int) -> tuple[Callable, np.ndarray, np.ndarray]` returns a JAX function
-  of the same inputs, its sparse output rows and columns. The function returns only
-  the one-dimensional float64 values array, in those coordinates' order.
+- `function(size: int) -> Callable` returns the plain JAX scalar Lagrangian or array
+  constraint function, with the same positional inputs. The harness constructs both
+  sparse derivatives with respect to argument zero.
 - `lower_triangle: bool = True` selects Hessian checks. Set it to `False` for Jacobians.
 
 For example, after defining the four functions in `workloads/my_problem.py`:
@@ -39,8 +42,8 @@ For example, after defining the four functions in `workloads/my_problem.py`:
 from workload import Workload
 
 WORKLOADS = (
-  Workload("my_problem", (12, 50), inputs, reference, scaly_kernel, aotax_kernel),
-  Workload("my_problem_jac", (12, 50), jac_inputs, jac_reference, scaly_jac, aotax_jac, lower_triangle=False),
+  Workload("my_problem", (12, 50), inputs, reference, scaly_kernel, lagrangian),
+  Workload("my_problem_jac", (12, 50), jac_inputs, jac_reference, scaly_jac, constraints, lower_triangle=False),
 )
 ```
 
