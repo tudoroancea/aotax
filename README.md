@@ -197,30 +197,58 @@ statistics in a vector avoids this compiler failure.
 
 ## Benchmarks
 
-`benchmarks/` compiles the lower triangle of a Lagrangian Hessian from a neural-network model
-predictive control problem, taken from [Scaly](https://github.com/PREDICT-EPFL/scaly), twice: by
-Scaly's own symbolic compiler, and from the same Lagrangian in JAX, differentiated sparsely by
-[asdex](https://adrianhill.de/asdex/) and compiled by aotax. Both are linked into one Google
-Benchmark harness, which checks every entry against a dense `jax.hessian` before timing.
+`benchmarks/` times two kinds of workloads on the CPU; `benchmarks/README.md` describes them and
+how to add one.
 
 ```bash
 uv run --group bench benchmarks/bench.py
 ```
 
-CPU time per evaluation on an Apple M4 Max, best of five processes:
+The derivative workloads come from [Scaly](https://github.com/PREDICT-EPFL/scaly)'s benchmark
+suite: the sparse Lagrangian Hessian (lower triangle) or constraint Jacobian of four model
+predictive control problems. Scaly compiles them with its own symbolic compiler; aotax compiles the
+same functions written in JAX and differentiated sparsely by [asdex](https://adrianhill.de/asdex/).
+Every entry is checked against a dense JAX derivative before timing. aotax CPU time divided by
+Scaly's on an Apple M4 Max, best of three processes:
 
-| horizon N | Scaly | aotax | ratio |
-|---:|---:|---:|---:|
-| 12 | 15.0 µs | 15.9 µs | 1.06× |
-| 50 | 61.3 µs | 58.2 µs | 0.95× |
-| 200 | 246.4 µs | 202.1 µs | 0.82× |
+| Problem | Sizes | Hessian | Jacobian |
+|---|---|---|---|
+| npmpc, neural-network dynamics | horizon 12, 50, 200 | 1.06×, 0.94×, 0.80× | 0.93×, 0.80×, 0.77× |
+| npmpc_decoder, network width | width 16, 64, 256 | 1.69×, 0.47×, 0.19× | 1.05×, 0.56×, 0.20× |
+| unbumpercars, network plant | 2, 4, 8 cars | 0.32×, 0.31×, 0.42× | 0.62×, 0.36×, 0.41× |
+| chain of masses | 3, 9, 17 masses | 3.72×, 3.35×, 2.24× | 16.1×, 5.73×, 4.12× |
+| race cars | horizon 5, 40, 500 | 5.28×, 4.55×, 5.22× | 5.09×, 4.76×, 4.95× |
 
-The first version of aotax ran IREE's own runtime and took 30.7, 92.2 and 322.9 µs. Generating the
-host as C removed about 14 µs of runtime work from every call. Most of the gain at the larger
-horizons comes from Accelerate: the matrix products of the network's layers, batched over stages
-and Hessian colors, run on Apple's matrix coprocessor. On other platforms they stay in IREE's code.
-The largest remaining cost, about a third of the time at every horizon, is in dispatches where
-IREE fuses a matrix product with elementwise work and generates scalar code for both.
+aotax is faster where neural networks dominate: their matrix products run on Apple's matrix
+coprocessor through Accelerate, and the rest vectorizes. It is slower on small dynamics without
+matrix products. There most of the gap is the derivative algorithm rather than the compiler:
+asdex's colored products do 4.5 to 11.5 times the arithmetic of Scaly's symbolic derivatives, and
+XLA running the same asdex functions is also 5 to 9 times slower than Scaly.
+
+The complete programs run whole algorithms written in JAX with loops: a fourth-order Runge-Kutta
+rollout, a Newton solve with `while_loop` and LU factorizations, a Gauss-Newton fit with Cholesky
+solves, a 15-step interior-point method for a quadratic program, and a batched Newton solve. aotax
+is compared with XLA running the same function inside one jitted loop, which excludes Python's
+call overhead. aotax time divided by XLA's:
+
+| Program | Sizes | aotax / XLA |
+|---|---|---|
+| rollout | 3×12, 3×50, 3×200, 5×50, 10×50 | 0.43×, 0.52×, 0.84×, 0.67×, 0.94× |
+| Newton | n = 4, 8, 16, 32, 64 | 0.78×, 1.07×, 1.22×, 1.43×, 1.19× |
+| Gauss-Newton | 16×3×8, 64×3×8, 64×5×12 | 0.45×, 0.44×, 0.35× |
+| quadratic program | 3×4×15, 3×12×15, 5×12×15 | 0.66×, 0.90×, 0.90× |
+| batched Newton | batch 1, 4, 16, 64 | 1.23×, 0.96×, 1.05×, 1.05× |
+
+Newton loses at larger n because hundreds of small dispatches surround each factorization.
+`benchmarks/scaly_devrush.py` compares Newton and the quadratic program with the solvers Scaly
+generates on its development branch.
+
+On the GPU, `device="metal"` pays off only for batches: from about 32 to 48 npmpc Hessians at
+horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and 6.3× at 128. A single call
+costs about 400 µs against 11 µs on the CPU. `notes/metal.md` has the measurements.
+
+The first version of aotax ran IREE's own runtime and took 30.7, 92.2 and 322.9 µs on the npmpc
+Hessian, now 15.9, 58.3 and 200.9 µs.
 
 ## License
 
