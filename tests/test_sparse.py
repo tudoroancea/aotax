@@ -67,3 +67,198 @@ def test_validation():
 
 def test_lazy_import():
   subprocess.run([sys.executable, "-c", "import aotax, aotax.sparse, sys; assert 'asdex' not in sys.modules"], check=True)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+@pytest.mark.parametrize("layout", ["overlap", "strided", "gather", "duplicates"])
+def test_structured_windows(hessian, layout):
+  x = np.linspace(-0.7, 0.9, 12)
+  indices = {
+    "overlap": np.arange(4)[:, None] + np.arange(3),
+    "strided": np.arange(4)[:, None] * 2 + np.arange(3) * 2,
+    "gather": np.array([[9, 2, 4], [4, 7, 1], [2, 0, 11]]),
+    "duplicates": np.array([[0, 0, 3], [2, 2, 2], [7, 3, 7]]),
+  }[layout]
+
+  def f(x, p, lam):
+    window = (
+      x[indices]
+      if layout in {"gather", "duplicates"}
+      else (jnp.stack([x[:8:2], x[2:10:2], x[4:12:2]], axis=1) if layout == "strided" else jnp.stack([x[:4], x[1:5], x[2:6]], axis=1))
+    )
+    y = jnp.sin(window.sum(axis=1) * p)
+    return lam @ y if hessian else y
+
+  count = len(indices)
+  args = x, np.zeros(count), np.zeros(count)
+  builder = sparse_hessian if hessian else sparse_jacobian
+  result = builder(f, *args, method="structured")
+  for seed in range(3):
+    rng = np.random.default_rng(seed)
+    changed = x + rng.normal(scale=0.1, size=x.size), rng.normal(size=count), rng.normal(size=count)
+    check_sparse(result, f, changed, hessian=hessian)
+  assert "local maps" in result.report
+  assert "input map" in result.report
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+def test_selected_broadcast_global_and_parameter_windows(hessian):
+  def f(p, x, weights):
+    y = jnp.sin(x[1:] + x[0] * p) * weights
+    return y.sum() if hessian else y
+
+  args = np.linspace(0.1, 0.6, 8), np.linspace(-1, 1, 9), np.zeros(8)
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, argnums=-2, method="structured")
+  check_sparse(result, f, (*args[:2], np.arange(8.0)), hessian=hessian, argnums=1)
+  assert np.any(result.cols == 0)
+
+
+def test_nonlinear_outer_reduction_and_mixed_axes():
+  x = np.linspace(-0.6, 0.8, 12).reshape(3, 4)
+  for f in [lambda x: jnp.sin(x).sum() ** 2, lambda x: jnp.sum(jnp.sin(x.sum(axis=0)) ** 2), lambda x: jnp.sum((x @ x.T) ** 2)]:
+    result = sparse_hessian(f, x, method="structured")
+    check_sparse(result, f, (x,), hessian=True)
+  assert result.rows.size == x.size * (x.size + 1) // 2
+
+
+def test_matrix_product_stage(tmp_path):
+  import aotax
+
+  def f(x, w, lam):
+    h = jnp.exp(x.reshape(4, 3) @ w)
+    return (lam * jnp.sin(h @ w.T)).sum()
+
+  args = np.linspace(-0.3, 0.4, 12), np.arange(15.0).reshape(3, 5) / 20, np.ones((4, 3))
+  result = sparse_hessian(f, *args, method="structured")
+  check_sparse(result, f, args, hessian=True)
+  native = aotax.compile(result.values, *args, out=tmp_path).load()
+  np.testing.assert_allclose(native(*args), result.values(*args), rtol=1e-11, atol=1e-11)
+  assert "stablehlo.dot_general" in (tmp_path / "iree/stablehlo.mlir").read_text()
+
+
+def test_custom_jvp_is_preserved():
+  @jax.custom_jvp
+  def f(x):
+    return jnp.sin(x)
+
+  @f.defjvp
+  def rule(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    return f(x), 3 * x * dx
+
+  x = np.linspace(-1, 1, 9)
+  for hessian, function in [(False, f), (True, lambda x: f(x).sum())]:
+    result = (sparse_hessian if hessian else sparse_jacobian)(function, x, method="structured")
+    check_sparse(result, function, (x,), hessian=hessian)
+
+
+def test_custom_jvp_fallback_and_strict_error():
+  pytest.importorskip("asdex")
+
+  @jax.custom_jvp
+  def f(x):
+    return jnp.sin(x)
+
+  @f.defjvp
+  def rule(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    return f(x), jnp.broadcast_to(dx.sum(), x.shape) * x
+
+  x = np.linspace(-0.5, 0.5, 5)
+  with pytest.raises(ValueError, match="custom_jvp_call.*reduce_sum"):
+    sparse_jacobian(f, x, method="structured")
+  for method in ["auto", "asdex"]:
+    result = sparse_jacobian(f, x, method=method)
+    check_sparse(result, f, (x,), hessian=False)
+  assert "pullback" in result.report
+
+
+def test_custom_vjp_fallback():
+  pytest.importorskip("asdex")
+
+  @jax.custom_vjp
+  def f(x):
+    return jnp.sin(x)
+
+  f.defvjp(lambda x: (f(x), x), lambda x, cotangent: (4 * x * cotangent,))
+  x = np.linspace(-1, 1, 6)
+  with pytest.raises(ValueError, match="custom_vjp_call"):
+    sparse_jacobian(f, x, method="structured")
+  result = sparse_jacobian(f, x)
+  reference = np.asarray(jax.jacrev(f)(x))
+  got = np.zeros(result.shape)
+  got[result.rows, result.cols] = result.values(x)
+  np.testing.assert_allclose(got, reference)
+  assert "custom_vjp_call" in result.report
+
+
+def test_affine_and_constant():
+  x = np.linspace(-1, 1, 6)
+  result = sparse_jacobian(lambda x: jnp.concatenate([x[1:] - x[:-1], -x, x[:1] * 3]), x, method="structured")
+  check_sparse(result, lambda x: jnp.concatenate([x[1:] - x[:-1], -x, x[:1] * 3]), (x,), hessian=False)
+  assert "affine coefficients" in result.report
+  for builder in [sparse_hessian, sparse_jacobian]:
+    result = builder(lambda x: jnp.array(2.0), x, method="structured")
+    assert result.rows.size == result.values(x).size == 0
+
+
+def test_control_flow_report():
+  pytest.importorskip("asdex")
+
+  def f(x):
+    return jax.lax.scan(lambda a, b: (a + jnp.sin(b), a), np.array(0.0), x)[1]
+
+  x = np.linspace(-1, 1, 5)
+  with pytest.raises(ValueError, match="scan.*backward"):
+    sparse_jacobian(f, x, method="structured")
+  result = sparse_jacobian(f, x)
+  assert "fallback: scan" in result.report
+  check_sparse(result, f, (x,), hessian=False)
+
+
+def test_nonsymmetric_custom_second_derivatives():
+  pytest.importorskip("asdex")
+
+  @jax.custom_jvp
+  def f(x):
+    return jnp.sum(x * x)
+
+  @f.defjvp
+  def rule(primals, tangents):
+    (x,), (dx,) = primals, tangents
+    return f(x), jnp.sum(x[::-1] * dx * jnp.arange(1, x.size + 1))
+
+  x = np.arange(4.0)
+  for method in ["auto", "asdex"]:
+    result = sparse_hessian(f, x, method=method)
+    check_sparse(result, f, (x,), hessian=True)
+
+
+def test_empty_output():
+  result = sparse_jacobian(lambda x: x[:0], np.zeros(3), method="structured")
+  assert result.shape == (0, 3)
+  assert result.values(np.zeros(3)).shape == (0,)
+
+
+@pytest.mark.parametrize("method", ["structured", "asdex"])
+@pytest.mark.parametrize("hessian", [False, True])
+def test_row_major_array_argument(method, hessian):
+  if method == "asdex":
+    pytest.importorskip("asdex")
+
+  def f(p, x):
+    y = p * jnp.sin(x.T)
+    return y.sum() if hessian else y
+
+  args = np.arange(6.0).reshape(3, 2), np.linspace(-1, 1, 6).reshape(2, 3)
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, argnums=1, method=method)
+  check_sparse(result, f, args, hessian=hessian, argnums=1)
+
+
+def test_batched_contraction():
+  def f(x, p):
+    return jnp.sin(jnp.einsum("bij,bjk->bik", x.reshape(2, 3, 4), p)).sum()
+
+  args = np.linspace(-0.8, 0.9, 24), np.linspace(-0.5, 0.8, 16).reshape(2, 4, 2)
+  result = sparse_hessian(f, *args, method="structured")
+  check_sparse(result, f, args, hessian=True)

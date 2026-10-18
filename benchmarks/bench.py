@@ -93,7 +93,7 @@ def main() -> None:
     if isinstance(workloads[name], ProgramWorkload):
       print(f"{'size':>12}{'aotax':>12}{'XLA loop':>12}{'JAX Python':>12}{'aot/XLA':>9}")
     else:
-      print(f"{'size':>5}{'scaly':>12}{'aotax':>12}{'structured':>12}{'ratio':>8}")
+      print(f"{'size':>5}{'scaly':>12}{'aotax':>12}{'aotax_structured':>18}{'ratio':>8}")
     for size in args.sizes or workloads[name].sizes:
       if isinstance(workloads[name], ProgramWorkload):
         size = str(size)
@@ -103,7 +103,7 @@ def main() -> None:
       size = int(size)
       scaly, aot = min(times[name, size, "scaly"]), min(times[name, size, "aotax"])
       structured = min(times[name, size, "aotax_structured"])
-      print(f"{size:>5}{scaly:>12.1f}{aot:>12.1f}{structured:>12.1f}{aot / scaly:>7.2f}x")
+      print(f"{size:>5}{scaly:>12.1f}{aot:>12.1f}{structured:>18.1f}{aot / scaly:>7.2f}x")
 
 
 if __name__ == "__main__":

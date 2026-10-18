@@ -60,9 +60,24 @@ def _derivative(f, args, argnums, method, *, hessian):
 
   flat_specs = list(specs)
   flat_specs[argnums] = jax.ShapeDtypeStruct((selected.size,), selected.dtype)
-  reason = "local extraction unavailable for this program"
-  if method == "structured":
-    raise ValueError(f"structured derivatives: {reason}; use method='asdex' or 'auto'")
+  reason = ""
+  if method != "asdex":
+    from aotax._sparse import Unsupported, structured
+
+    try:
+      result = structured(flat, flat_specs, argnums, hessian)
+    except Unsupported as error:
+      reason = str(error)
+      if method == "structured":
+        raise ValueError(f"structured derivatives: {reason}; use method='asdex' or 'auto'") from error
+    else:
+
+      def values(*xs):
+        xs = list(xs)
+        xs[argnums] = jnp.asarray(xs[argnums]).reshape(-1)
+        return result.values(*xs)
+
+      return SparseDerivative(values, result.rows, result.cols, result.shape, result.report)
   result = _asdex(flat, flat_specs, argnums, hessian)
 
   def values(*xs):
@@ -85,7 +100,24 @@ def _asdex(f, specs, argnums, hessian):
     if error.name != "asdex":
       raise
     raise ImportError("sparse derivatives require asdex; install aotax[sparse]") from error
-  coloring = (asdex.hessian_coloring if hessian else asdex.jacobian_coloring)(f, *(np.zeros(s.shape, s.dtype) for s in specs), argnums=argnums)
+  samples = tuple(np.zeros(s.shape, s.dtype) for s in specs)
+  closed = jax.make_jaxpr(f)(*specs)
+  custom = _custom_calls(closed.jaxpr)
+  if custom:
+    differentiated = jax.grad(f, argnums=argnums) if hessian else f
+    output = jax.eval_shape(differentiated, *specs)
+
+    def pullback(seed, *xs):
+      return jax.vjp(differentiated, *xs)[1](seed)[argnums].reshape(-1)
+
+    transposed = asdex.jacobian_sparsity(pullback, np.zeros(output.shape, output.dtype), *samples, argnums=0)
+    pattern = asdex.SparsityPattern(transposed.cols, transposed.rows, transposed.shape[::-1], tuple(specs), argnums)
+    if hessian:
+      coloring = asdex.hessian_coloring_from_sparsity(pattern, symmetric=False)
+    else:
+      coloring = asdex.jacobian_coloring_from_sparsity(pattern, mode="rev" if "custom_vjp_call" in custom else None)
+  else:
+    coloring = (asdex.hessian_coloring if hessian else asdex.jacobian_coloring)(f, *samples, argnums=argnums)
   compressed = (asdex.compressed_hessian_from_coloring if hessian else asdex.compressed_jacobian_from_coloring)(f, coloring)
   rows, cols = np.asarray(coloring.sparsity.rows), np.asarray(coloring.sparsity.cols)
   keep = np.flatnonzero(rows >= cols) if hessian else np.arange(rows.size)
@@ -97,4 +129,22 @@ def _asdex(f, specs, argnums, hessian):
     return compressed(*xs)[gather[:, 0], gather[:, 1]]
 
   report = f"asdex {coloring.mode}: {coloring.num_colors} colors, {keep.size} entries; direct {'lower-triangle' if hessian else 'Jacobian'} recovery"
+  if custom:
+    report += "; JAX pullback structural detection preserves custom derivative rules"
+    if hessian:
+      report += "; nonsymmetric coloring does not assume custom rules have symmetric second derivatives"
   return SparseDerivative(values, _indices(rows[keep]), _indices(cols[keep]), coloring.sparsity.shape, report)
+
+
+def _custom_calls(jaxpr):
+  if hasattr(jaxpr, "jaxpr") and jaxpr.jaxpr is not jaxpr:
+    return _custom_calls(jaxpr.jaxpr)
+  if isinstance(jaxpr, (tuple, list)):
+    return set().union(*map(_custom_calls, jaxpr))
+  found = set()
+  for eq in getattr(jaxpr, "eqns", ()):
+    if eq.primitive.name in {"custom_jvp_call", "custom_vjp_call"}:
+      found.add(eq.primitive.name)
+    for p in eq.params.values():
+      found.update(_custom_calls(p))
+  return found

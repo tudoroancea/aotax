@@ -239,10 +239,17 @@ array selected by `argnums=0`. Other arguments remain runtime inputs. Hessians r
 output and return its lower triangle. Jacobians flatten one array output and the selected input
 in row-major order. The frozen result contains `values`, immutable sorted unique `rows` and `cols`,
 `shape`, and a readable `report`. Structural entries remain present when runtime values are zero.
+The contract covers finite derivatives and aotax's documented floating-point behavior.
 
 `method="asdex"` uses structural detection and coloring with direct sparse recovery.
 `method="auto"` uses proved local structure and otherwise falls back to asdex, with the reason
-in the report. `method="structured"` raises when extraction is unsupported.
+in the report. It extracts output neighborhoods, or gradient neighborhoods for Hessians, and
+differentiates the local array programs with JAX. Static gathers preserve overlapping and repeated
+input coordinates; contractions retain their matrix operations. Pointwise custom Jacobian-vector
+product (JVP) rules are preserved. `method="structured"` raises when extraction is unsupported.
+Large local graphs,
+shared nonlinear maps selected by gathers, general control flow and non-pointwise custom rules
+currently fall back.
 
 ## Benchmarks
 
@@ -254,8 +261,9 @@ uv run --group bench benchmarks/bench.py
 ```
 
 The derivative workloads come from [Scaly](https://github.com/PREDICT-EPFL/scaly)'s benchmark
-suite: the sparse Lagrangian Hessian (lower triangle) or constraint Jacobian of four model
-predictive control problems. Scaly compiles them with its own symbolic compiler; aotax compiles the
+suite: sparse Lagrangian Hessians and constraint Jacobians for chain and race-car control,
+a neural-process controller with horizon and decoder-width sweeps, and a learned-car safety filter.
+Scaly compiles them with its own symbolic compiler; aotax compiles the
 same functions written in JAX through `aotax.sparse`. The `aotax` column uses
 [asdex](https://adrianhill.de/asdex/) and `aotax_structured` uses automatic local extraction with
 asdex fallback. Each library has a `sparse-report.txt` recording its method and construction time.

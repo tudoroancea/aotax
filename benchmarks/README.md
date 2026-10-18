@@ -13,6 +13,8 @@ must agree within `1e-9 + 1e-9 * abs(reference)`, and missing entries must be ze
 The `scaly` column uses Scaly's symbolic compiler. `aotax` uses `aotax.sparse` with
 `method="asdex"`; `aotax_structured` uses `method="auto"`. Each aotax library has a
 `sparse-report.txt` with its extraction/fallback report and Python construction time.
+Reports name the local derivative method, repetition counts, input widths and index maps, or
+the operation that required fallback. Construction time excludes compilation and native timing.
 Results use the best CPU time across interleaved fresh processes. Generated files live
 in `build/<workload>/N<size>/<backend>/`; `build/results.csv` includes every repetition.
 
