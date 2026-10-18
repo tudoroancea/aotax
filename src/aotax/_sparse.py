@@ -320,7 +320,11 @@ class Extract:
     self.demands.setdefault(n, []).append(ids)
     requested = ids
     if self.merged is not None and n.eq is not None and n in self.merged:
-      ids, _ = unique(np.concatenate([*self.merged[n], requested], axis=1))
+      demands = self.merged[n]
+      if not n.dependent:
+        shared = np.all(requested == requested[:1])
+        demands = [d for d in demands if np.all(d == d[:1]) == shared]
+      ids, _ = unique(np.concatenate([*demands, requested], axis=1))
     ids, _ = unique(ids)
     inv = same(np.stack([np.searchsorted(a, b) for a, b in zip(ids, requested)]))
     key = (id(n), ids[0].tobytes(), ids.strides[0], None if ids.strides[0] == 0 else ids.tobytes())

@@ -322,3 +322,20 @@ def test_wide_scalar_hessian_uses_construction_budget():
   assert "fallback:" in result.report
   assert "local Hessian width" in result.report
   check_sparse(result, f, (x,), hessian=True)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
+def test_transformed_shared_and_moving_parameter_windows(hessian):
+  def f(x, p):
+    q = jnp.sin(p)
+    h = jnp.sin(x.reshape(11, 2) @ q[-4:].reshape(2, 2) + q[:11, None])
+    y = jnp.stack([h[:, 0], h[:, 1], h[:, 0] * h[:, 1]], axis=1)
+    return jnp.sum(y * y) if hessian else y
+
+  args = np.linspace(-0.4, 0.5, 22), np.linspace(-0.7, 0.8, 15)
+  result = (sparse_hessian if hessian else sparse_jacobian)(f, *args, method="structured")
+  check_sparse(result, f, args, hessian=hessian)
+  closed = jax.make_jaxpr(result.values)(*args)
+  products = [eq for eq in closed.jaxpr.eqns if eq.primitive.name == "dot_general"]
+  assert products
+  assert all(not any(eq.params["dimension_numbers"][1]) for eq in products)
