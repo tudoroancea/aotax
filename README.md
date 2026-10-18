@@ -1,5 +1,10 @@
 # aotax
 
+> [!WARNING]
+> aotax is an experiment, not a finished library. Its interface, generated code and supported
+> features change without notice, and it has only been tested on macOS on Apple silicon. Do not
+> use it in production or in a project that depends on it.
+
 Compile a JAX function ahead of time into a static C library and a header. The program that links
 it needs no Python, no JAX and no just-in-time compiler: only the archive, libm and, on macOS, Accelerate.
 
