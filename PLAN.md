@@ -11,6 +11,11 @@ chain, race_cars, unbumpercars, npmpc, npmpc_decoder, each Hessian and `_jac`), 
 interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit-function solvers
 (`src/scaly/roots`), exports to CasADi and acados (`src/scaly/export`), and its `bench/` tree.
 
+## Reviews
+
+- [ ] Review G1b (Metal) and F2, and the delta checks H1c and H2 missed: Claude's rate limit
+  blocked them inside the agents.
+
 ## Review of phase 1
 
 - [x] Cross-family review of 1af8fad (Fable 5.1, xhigh), fixes, and delta check (Fable 5.1, low): all eight findings resolved.
@@ -36,40 +41,14 @@ interior-point solvers (`src/scaly/opt/ipm`, stagewise KKT), Newton and implicit
   aotax wins where neural networks dominate (Accelerate, vectorized code) and loses 2-16× on small
   dense dynamics without matrix products, where time spreads over elementwise and transpose
   dispatches, copies, fills and scalar `sin`/`cos`/`tanh` calls.
-- [x] F2. Sweep all workloads, profile the worst ratios, choose the next optimization round.
-  - [x] Record one full interleaved baseline, three fresh processes per binary.
-  - [x] Measure coloring, arithmetic, Accelerated Linear Algebra (XLA) loop execution and dispatch costs for chain_jac M=3,
-    chain M=17 and both race_cars derivatives at N=500. This depends on baseline compilation.
-  - [x] Test general optimizations identified by the measurements, keeping host edits isolated
-    from H1. Record rejected candidates and compare retained changes in a full sweep.
-  - [x] Run tests, lint, format and types; document results and attempt the Claude review.
-    Commit locally after validation. H1 and the Metal investigation can proceed independently.
-  - The four cases use 14 reverse products, 42 Hessian-vector products, 4 Hessian-vector products,
-    and 6 reverse products respectively. Scaly and asdex agree on the sparse coordinates.
-    Estimated scalar arithmetic is 0.49 / 19.58 / 4.27 / 2.62 million operations for asdex/XLA,
-    versus 0.068 / 4.35 / 0.558 / 0.228 million for Scaly's optimized scalar program.
-    These are compiler estimates before machine-code generation, with loops and calls counted.
-  - XLA's loop wall times are 36 / 1153 / 354 / 211 µs, with all inputs perturbed each iteration
-    and all output entries consumed. XLA uses extra CPU threads. Disabling its parallel task
-    assignment gives 37 / 2168 / 519 / 359 µs; aotax takes 64 / 2441 / 256 / 231 µs on one thread.
-    Scaly takes 3.92 / 1145 / 49.02 / 40.82 µs. The main gap is sparse differentiation and the
-    dense intermediate arrays. Host work outside dispatches and memory operations takes
-    0.9 / 2.3 / 2.8 / 1.4 µs; replacing dispatch kernels with no-ops gives 1.1 / 2.5 / 3.2 / 1.5 µs.
-    The chain Hessian fills 29 MB per call; race-car transpose dispatches take about 55 µs.
-  - Selected broadcast barriers for f64 `sin`, `cos` and `tanh` in programs without dot operations.
-    An interleaved best-of-five comparison cuts race-car Jacobians by 12-13%, with unchanged
-    Hessian times. Matrix-product programs need the exclusion: the same broadcast barriers slow
-    unbumpercars at 8 cars by 7%. Tests: 42 passed, one expected IREE failure. Lint, format and
-    types pass. Both full sweeps, three interleaved processes per binary, pass every dense check.
-    Claude Fable 5.1 at high effort could not review dd21ee4: its API rate limit was reached.
-    The exclusion also covers scalar dot operations in race-car Hessians. Only the three
-    race-car Jacobian kernels change; host and dispatch objects are identical for the other 27 cases.
-    Full-sweep race-car Jacobians improve from 2.67 / 16.67 / 230.98 to 2.30 / 14.61 / 200.17 µs
-    at N=5 / 40 / 500. At N=500, dispatches drop from 114 to 109 and scalar libm results from
-    21,500 to 11,500, counting a paired sin/cos call as two results. The remaining work belongs
-    mostly to dense color batches and their copies, fills and transposes. Next: local stage and
-    link derivatives with sparse block assembly, sparse automatic differentiation that skips
-    zero tangents, and direct lower-triangle decompression in the JAX formulation or asdex.
+- [x] F2. The losses on chain and race_cars are mostly asdex's algorithm, not the compiler: asdex
+  performs 4.5-11.5× the arithmetic of Scaly's symbolic derivatives (14 to 42 products per
+  evaluation over dense color batches), and XLA running the same asdex functions is also 5-9× slower
+  than Scaly. Host work outside dispatches is 1-3 µs. Kept: `src/aotax/math.py` computes broadcast
+  f64 `sin`, `cos` and `tanh` before broadcasting in programs without dot operations (race-car
+  Jacobians 12-13% faster; other kernels unchanged). Rejected: vector peeling off, a polynomial
+  `tanh` (≤ 3 ulp, 0-3% gain), barriers after every transcendental. Next: derivatives of local
+  stages assembled into sparse blocks, and sparse differentiation that skips zero tangents.
 
 ## G. Metal GPU path
 
@@ -113,8 +92,13 @@ into C (LAPACK from Accelerate, or a user's solver) serves both the optimization
   to 2.8e-16; `/tmp/aotax-h1c/scaly_foreign.py`. Fable 5.1 high-effort review approved with no
   act-on findings. IREE 3.12's scalar-result loop crash is documented; vector statistics work.
   Two small review notes addressed; local checks pass. Delta review blocked by Claude's rate limit.
-- [ ] H2. The H0 workloads in the benchmark harness, against Scaly's generated solvers where an
-  equivalent exists and against JAX's own XLA CPU execution.
+- [x] H2. `ProgramWorkload` in the harness: chain_rollout, newton, gauss_newton, chain_qp and
+  batched_newton, checked against `jax.jit` (exact iteration counts), timed natively and as XLA
+  amortized inside one jitted loop. aotax beats XLA on the rollout (1.0-2.3×), Gauss-Newton
+  (2.2-2.9×) and the QP (1.1-1.5×), and loses on Newton for n ≥ 8 (up to 1.41× at n=32), where
+  hundreds of small dispatches surround each LU. `benchmarks/scaly_devrush.py` compares with
+  Scaly's devrush solvers: Newton 0.18 vs 1.20 µs at n=4 and 59.8 vs 63.0 at n=64 (same iterations);
+  the QP 4.6 vs 21 µs (different algorithms and stopping rules).
 
 ## Order
 
