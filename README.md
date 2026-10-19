@@ -271,7 +271,7 @@ reverse mode otherwise. Matrix products retain their contractions; shared parame
 Selection uses graph properties, without timing kernels. Each extraction pass has at most 256 local
 programs, each with at most 128 selected inputs, 512 array operations and a backward-demand depth of 128.
 Before scalar Hessian differentiation, input width times the sizes of local arguments, results and
-operands must not exceed 262,144.
+operands, with custom JVP rule bodies counted two levels deep, must not exceed 262,144.
 Groups exceeding the array-operation budget split into smaller sums. Wide Jacobian
 neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
 maps with multiple computed gather sources or a different floating dtype from the selected input,

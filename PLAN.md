@@ -150,7 +150,18 @@ new modules until their design is settled.
   control-flow fallbacks and quadratic assembly storage fixed; a fix check (high) found nested
   bodies missed by the asdex out-of-bounds guard and an over-broad `cond` rejection, both fixed.
   asdex 0.5.2 drops clamped out-of-bounds gather indices; aotax rejects them.
-- [ ] J3. Bounded scalar local derivatives and nested neighborhoods; accept on the chain Hessian.
+- [x] J3. Hessian terms with the same input neighborhood are grouped, including neighbor coupling
+  repeated inside a stage; groups over the operation budget split into smaller sums. Construction
+  is bounded before scalar differentiation: input width times local argument, result and operand
+  sizes (custom JVP rule bodies counted two levels deep) at most 262,144, and at most 256 local
+  programs per pass. µs asdex / auto / Scaly, chain Hessian: M=3 74 / 16 / 22, M=9 942 / 758 / 303,
+  M=17 2162 / 1805 / 1042; other workloads within ±1% of main. Construction takes 0.9 / 6.4 / 9.6 s.
+  At M=17 the pattern keeps 45,000 structural zeros beyond asdex's 73,923 entries, and native
+  compilation peaks at 3.4 GiB, against 0.96 GiB for the asdex path. Pruning gradient components
+  before the second differentiation made IREE compilation too heavy; reverse-over-reverse was
+  slower. Reviewed by gpt-6.1-sol (xhigh): custom JVP rule bodies escaped the construction budget;
+  the fix check (high) found that nested rules still did. Both fixed with regression tests; the
+  second fix was confirmed with the checker's probe, without another review round.
 - [x] J4. Shared local maps: a computed array read by several factors through gathers or
   overlapping slices is kept as one map. Outputs no factor uses are dropped, its local Jacobian and
   second derivatives are computed once per instance, and derivatives compose through it. µs asdex /

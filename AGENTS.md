@@ -72,6 +72,8 @@ uv run --group bench benchmarks/bench.py --reps 5
   custom-JVP `jvp_jaxpr_fun.call_wrapped`. Rerun tests/test_sparse*.py on JAX upgrades.
 - Shared-map composition keeps both orientations of downstream second derivatives before
   lower-triangle recovery, because custom derivative rules can make them nonsymmetric.
+- The scalar Hessian construction budget counts parameter arguments, operands and custom JVP rule
+  bodies two levels deep: second derivatives replay a rule, and the rules it calls, per element.
 
 ## Measuring
 
@@ -107,6 +109,8 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Barriers after every f64 `sin`, `cos` and `tanh` slow npmpc N=200 by 12%. Keep matrix-product
   programs' fusion; separate only libm results that feed broadcasts in programs without dot operations.
   Even the narrower broadcast rule slows unbumpercars at 8 cars by 7% if applied across products.
+- Chain Hessian: pruning gradient components before the second differentiation makes IREE
+  compilation too heavy, and reverse-over-reverse is slower; grouping identical input neighborhoods works.
 - Sparse differentiation dominates the remaining gap: Scaly and asdex agree on the nonzeros,
   but asdex's color batches do 4.5-11.5 times the estimated scalar arithmetic of Scaly's program
   on the four profiled cases. Host work outside dispatches and memory operations is only
