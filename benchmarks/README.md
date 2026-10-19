@@ -19,8 +19,9 @@ Jacobian outputs sharing nonlinear work use one local program per instance. Shar
 parameters remain unbatched. Small non-matrix programs use scalar leaves; local Jacobians
 choose forward mode when input width is at most output count, and reverse mode otherwise.
 The static selection budget is 128 inputs and 512 array operations per local program.
-Non-matrix Hessians exceeding both width 8 and 128 operations use asdex pending nested
-sparse differentiation. There is no runtime tuning or workload-specific selection.
+Wider non-matrix Hessians group terms with identical input neighborhoods, with input width
+times the sizes of local arguments, results and operands limited to 262,144. There is no runtime
+tuning or workload-specific selection.
 Construction time excludes compilation and native timing.
 Results use the best CPU time across interleaved fresh processes. Generated files live
 in `build/<workload>/N<size>/<backend>/`; `build/results.csv` includes every repetition.

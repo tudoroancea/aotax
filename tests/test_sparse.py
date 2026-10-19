@@ -306,9 +306,7 @@ def test_singleton_array_dot_and_reduced_jacobian():
     check_sparse(result, f, (x, p), hessian=False)
 
 
-def test_wide_scalar_hessian_uses_construction_budget():
-  pytest.importorskip("asdex")
-
+def test_wide_scalar_hessian():
   def f(x):
     h = x.reshape(3, 12)
     for _ in range(12):
@@ -316,12 +314,59 @@ def test_wide_scalar_hessian_uses_construction_budget():
     return h.sum()
 
   x = np.linspace(-0.3, 0.4, 36)
-  with pytest.raises(ValueError, match="local Hessian width.*nested sparse"):
+  result = sparse_hessian(f, x, method="structured")
+  check_sparse(result, f, (x,), hessian=True)
+
+
+def test_scalar_hessian_construction_budget():
+  pytest.importorskip("asdex")
+
+  def f(x):
+    h = x.reshape(2, 96)
+    for _ in range(4):
+      h = jnp.sin(h + 0.1 * jnp.roll(h, 1, axis=1))
+    return jnp.sin(h.sum(axis=1)).sum()
+
+  x = np.linspace(-0.3, 0.4, 192)
+  with pytest.raises(ValueError, match="scalar differentiation exceeds construction budget"):
     sparse_hessian(f, x, method="structured")
   result = sparse_hessian(f, x)
-  assert "fallback:" in result.report
-  assert "local Hessian width" in result.report
+  assert "fallback:" in result.report and "construction budget" in result.report
   check_sparse(result, f, (x,), hessian=True)
+
+
+def test_scalar_hessian_bounds_runtime_parameter_reductions():
+  f = lambda x, p: jnp.sin(x).sum() * p.sum()
+  specs = jax.ShapeDtypeStruct((1,), np.float64), jax.ShapeDtypeStruct((262_144,), np.float64)
+  with pytest.raises(ValueError, match="scalar differentiation exceeds construction budget"):
+    sparse_hessian(f, *specs, method="structured")
+
+
+@pytest.mark.parametrize("coupling", ["line", "grid", "dense", "nonlinear_sum"])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_nested_stage_hessians(coupling, overlap):
+  width = 16
+  indices = np.arange(3)[:, None] * (width // 2 if overlap else width) + np.arange(width)
+
+  def f(x, p, lam):
+    h = x[indices].reshape(3, 4, 4)
+    for _ in range(2):
+      if coupling == "grid":
+        neighbors = jnp.roll(h, 1, axis=1) + jnp.roll(h, -1, axis=2)
+      elif coupling == "dense":
+        neighbors = h.sum(axis=(1, 2), keepdims=True)
+      else:
+        flat = h.reshape(3, width)
+        neighbors = (jnp.roll(flat, 1, axis=1) + jnp.roll(flat, -1, axis=1)).reshape(h.shape)
+      h = jnp.sin(h + p * neighbors)
+    if coupling == "nonlinear_sum":
+      return jnp.sum(lam * jnp.sin(h.sum(axis=(1, 2))))
+    return jnp.sum(lam[:, None, None] * h * h)
+
+  args = np.linspace(-0.3, 0.4, int(indices.max()) + 1), np.array(0.0), np.zeros(3)
+  result = sparse_hessian(f, *args, method="structured")
+  for p, lam in [(0.0, np.ones(3)), (0.13, np.array([0.2, -0.4, 0.7])), (-0.2, np.zeros(3))]:
+    check_sparse(result, f, (args[0], np.array(p), lam), hessian=True)
 
 
 @pytest.mark.parametrize("hessian", [False, True])

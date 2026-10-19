@@ -9,7 +9,7 @@ import numpy as np
 from jax.core import Tracer, eval_jaxpr
 from jax.extend import core
 
-from aotax._sparse import ROUTING, Graph, routing
+from aotax._sparse import ROUTING, Graph, Unsupported, routing
 
 
 def obj(value):
@@ -20,9 +20,12 @@ def obj(value):
   return out
 
 
-def scalarize(fn, *specs):
+def scalarize(fn, *specs, hessian=False):
   closed = jax.make_jaxpr(fn)(*specs)
   graph = Graph(closed, -1)
+  work = sum(s.size for s in specs) + sum(n.size + sum(a.size for a in n.ins) for n in graph.nodes)
+  if hessian and specs[0].size * work > 262_144:
+    raise Unsupported("local Hessian: scalar differentiation exceeds construction budget 262144")
 
   def scalar_fn(xs, *params):
     args = []
@@ -99,7 +102,7 @@ def differentiate(fn, specs, hessian, matrix, outputs, *, full=False):
       return array_derivative(x, *p)[r, c]
 
   else:
-    sf = scalarize(fn, *specs)
+    sf = scalarize(fn, *specs, hessian=hessian)
     r, c = np.tril_indices(width) if hessian and not full else np.indices((width, width) if hessian else (outputs, width)).reshape(2, -1)
     if hessian:
       derivative = jax.hessian(sf)

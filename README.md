@@ -261,14 +261,18 @@ Hessians with downstream adjoints. Overlapping slices can use the same compositi
 flat extraction exceeds its budget. Input-independent outputs remain runtime coefficients.
 
 Small programs without matrix products use scalar input leaves to remove absent tangents.
+Wider Hessians group terms with the same input neighborhood, including repeated neighbor
+coupling inside a stage, while keeping different neighborhoods separate.
 Jacobians use forward mode when the local input width is at most the output count, and
 reverse mode otherwise. Matrix products retain their contractions; shared parameters use
 `vmap` with `in_axes=None`. Pointwise custom Jacobian-vector product (JVP) rules are preserved.
 `method="structured"` raises when extraction exceeds its supported rules or construction budget.
 
-Selection uses graph properties, without timing kernels: local programs have at most 128
-selected inputs, 512 array operations and a backward-demand depth of 128. Non-matrix Hessians exceeding both width 8 and
-128 operations use asdex because scalar second derivatives grow too large. Wide Jacobian
+Selection uses graph properties, without timing kernels. Each extraction pass has at most 256 local
+programs, each with at most 128 selected inputs, 512 array operations and a backward-demand depth of 128.
+Before scalar Hessian differentiation, input width times the sizes of local arguments, results and
+operands must not exceed 262,144.
+Groups exceeding the array-operation budget split into smaller sums. Wide Jacobian
 neighborhoods stay separate; small outputs sharing nonlinear work are merged. Shared nonlinear
 maps with multiple computed gather sources or a different floating dtype from the selected input,
 general control flow and non-pointwise custom rules also fall back.

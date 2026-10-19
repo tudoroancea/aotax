@@ -324,3 +324,29 @@ def test_parameter_only_cond_hessian(method):
     got = np.zeros(result.shape)
     got[result.rows, result.cols] = jax.jit(result.values)(x, p)
     np.testing.assert_allclose(got, jax.hessian(f)(x, p), rtol=1e-11, atol=1e-11)
+
+
+def test_wide_scalar_preserves_custom_second_derivatives():
+  @jax.custom_jvp
+  def custom(a, b):
+    return a * a + b
+
+  @custom.defjvp
+  def rule(primals, tangents):
+    a, b = primals
+    da, db = tangents
+    return custom(a, b), da * a * b + 2 * db
+
+  def f(x, p):
+    h = x.reshape(3, 12)
+    h = custom(h, p * jnp.roll(h, 1, axis=1))
+    return (h.sum(axis=1) ** 2).sum()
+
+  x = np.linspace(-0.3, 0.4, 36)
+  check(f, (x, np.array(0.2)), hessian=True)
+
+
+def test_local_program_count_budget():
+  f = lambda x: sum(jnp.sin(x[i] + i / 10) ** 2 for i in range(257))
+  with pytest.raises(ValueError, match="more than 256 distinct index programs"):
+    sparse_hessian(f, jax.ShapeDtypeStruct((257,), np.float64), method="structured")

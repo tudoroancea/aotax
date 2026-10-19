@@ -486,14 +486,6 @@ class Extract:
     inputs, _ = unique(np.concatenate(selected, axis=1)) if selected else (np.empty((self.count, 0), int), None)
     if inputs.shape[1] > 128:
       raise Unsupported(f"local input: width {inputs.shape[1]} exceeds 128; reduction/contraction mixes the candidate axis")
-    if (
-      hessian
-      and inputs.shape[1] > 8
-      and len(self.ops) > 128
-      and not any(n.eq.primitive.name == "dot_general" and max(len(a.shape) for a in n.ins) >= 2 for n, _ in self.anchors)
-    ):
-      operation = self.anchors[-1][0].eq.primitive.name if self.anchors else "reduce_sum"
-      raise Unsupported(f"{operation}: local Hessian width {inputs.shape[1]} with {len(self.ops)} operations needs nested sparse differentiation")
     params = []
     param_leaves = []
     lookups = {}
@@ -576,7 +568,7 @@ def program(ex, term, indices):
   return value if sign == 1 else ex.op(lambda x: -x, (value,), "neg")
 
 
-def extract(graph, specs, hessian, *, linear=True):
+def extract(graph, specs, hessian, *, linear=True, split_groups=False):
   roots = terms(graph) if linear else [(graph.output, np.arange(graph.output.size), np.arange(graph.output.size), (), 1)]
   groups = []
   neighborhoods = []
@@ -594,7 +586,7 @@ def extract(graph, specs, hessian, *, linear=True):
       continue
     matrix = any(n.eq.primitive.name == "dot_general" and max(len(a.shape) for a in n.ins) >= 2 for n, _ in ex.anchors)
     groups.append((i, indices, ex.anchors if piece is not None and (piece[1].shape[1] <= 8 or matrix) else []))
-    neighborhoods.append(piece[1] if piece is not None and not linear else None)
+    neighborhoods.append(piece[1] if piece is not None and (not linear or (hessian and piece[1].shape[1] > 8)) else None)
 
   # Two demanded outputs share an instance when they demand the same nonlinear primal.
   offsets = np.r_[0, np.cumsum([len(indices) for _, indices, _ in groups])]
@@ -636,9 +628,9 @@ def extract(graph, specs, hessian, *, linear=True):
     buckets.setdefault(signature, []).append([k for _, k in component])
   pieces = []
   for signature, instances in buckets.items():
-    pending = [np.asarray(instances)]
+    pending = [(signature, np.asarray(instances))]
     while pending:
-      instances = pending.pop()
+      signature, instances = pending.pop()
       ex = Extract(graph, len(instances))
       outputs, rows = [], []
       try:
@@ -651,9 +643,17 @@ def extract(graph, specs, hessian, *, linear=True):
         outputs = [program(ex, roots[groups[g][0]], groups[g][1][instances[:, col]]) for col, g in enumerate(signature)]
         piece = ex.finish(outputs, hessian)
       except Split as split:
-        pending.extend(instances[split.labels == k] for k in np.unique(split.labels))
+        pending.extend((signature, instances[split.labels == k]) for k in np.unique(split.labels))
+        continue
+      except Unsupported:
+        if not split_groups or len(signature) == 1:
+          raise
+        mid = len(signature) // 2
+        pending.extend((signature[s], instances[:, s]) for s in (slice(None, mid), slice(mid, None)))
         continue
       if piece is not None:
+        if len(pieces) >= 256:
+          raise Unsupported("local graph: more than 256 distinct index programs")
         fn, inputs, params = piece
         pieces.append(
           (
@@ -711,7 +711,7 @@ def structured(f, specs, argnums, hessian):
     sources = [n for n, reads in slices.items() if any(np.intersect1d(a, b).size for i, a in enumerate(reads) for b in reads[:i])]
     if len(sources) == 1:
       return compose(graph, specs, sources[0], hessian)
-    raise
+    pieces, shape = extract(graph, specs, hessian, split_groups=True)
   return local_derivatives(pieces, shape, specs, argnums, hessian)
 
 
@@ -758,7 +758,8 @@ def local_derivatives(pieces, shape, specs, argnums, hessian, full=False):
   report = "structured: grouped primal " + ("sums; local hessian (forward over reverse)" if hessian else "outputs; local Jacobians")
   reports.insert(
     0,
-    "selection: at most 128 inputs, 512 array operations and backward-demand depth 128; non-matrix Hessians exceeding both width 8 and 128 operations use asdex",
+    "selection: at most 128 inputs, 512 array operations and backward-demand depth 128; "
+    "scalar Hessian construction (input width * argument, result and operand sizes) at most 262144",
   )
   return assemble(evaluators, allrows, allcols, shape, specs[argnums].dtype, "\n".join([report, *reports]))
 
