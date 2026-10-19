@@ -183,8 +183,12 @@ new modules until their design is settled.
   then resumes (src/aotax/cpu.py). race_cars N=40/500 16% faster, race_cars_jac N=500 13%; other
   workloads within ±3%; compilation 0.1 s slower. Reviewed by gpt-6.1-sol (high): scalable tile
   lists and scalar operands are now left to IREE.
-- [ ] K2. Tiny-dispatch C emitter. Wait for J, then measure on its local stage functions, where a
-  whole stage may fit the budget.
+- [x] K2. Tiny-dispatch C emitter, measured on the structured kernels (notes/scalarization.md).
+  With every tensor at most 256 elements, plain C makes race_cars N=5 47% faster but race_cars
+  N=40 11% and chain_jac M=9 13% slower: unrolled scalar C loses to IREE's vector loops at 120-160
+  elements. At most 64 elements, the production emitter (312 lines) makes race_cars N=5 20% and its
+  Jacobian 23% faster, with every other case within ±1%. Not merged: aotax stays an experiment in
+  IREE's own code generation. The code is on branch `ted/measure-tiny-c-dispatches`.
 
 I and K1 are independent. One agent does J1 then J2; J3 and J4 follow J2 and can run in parallel
 with separate file ownership; K2 follows J2.

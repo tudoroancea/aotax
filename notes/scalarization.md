@@ -223,3 +223,224 @@ Primary artifacts:
 - `iree-help.txt`: the pinned compiler's actual available options.
 
 The report does not propose repeating rejected vector-peeling, tanh approximation, broad transcendental barriers, native 32/64-byte vector widths, SME, aggressive fusion, or inline-static experiments. It does not change the derivative algorithm or claim to close its arithmetic gap.
+
+## K2 repeat on structured derivatives
+
+Measured main `5bc1b55219a3760959ac093dc15f591891497fea` on 2026-10-19, after J1-J4,
+K1 and accurate math became the default. The 256-element gate fails. Plain C reduces race_cars N=5 latency
+by 46.9% and race_cars_jac N=5 by 39.3%, but regresses race_cars N=40 by 11.1% and
+chain_jac M=9 by 13.2%. The gate requires at least one 10% improvement and no regression above
+2%. The 256-element selector was stopped at measurement; the 64-element follow-up below passed.
+
+The candidate adapts the K0 emitter to the exact `method="auto"` functions built by
+`benchmarks/harness.py`. It expands eligible tensors completely, shares named scalar expressions
+across outputs, and computes results before their stores. Eligibility examines every tensor
+operand and result, including binding spans and nested operations. Every extent must be static
+and every tensor must contain at most 256 elements. Further limits are 4,096 named scalar values,
+8,192 source lines, 262,144 bytes of line content and reductions of at most 16 elements. Unsupported
+operations, dynamic tensor shapes and code over budget retain IREE's original dispatch. Floating
+arithmetic is emitted without identity folding; elementary functions use libm. The generated host,
+HAL allocation and staging, accurate math preparation, K1 tiles and Accelerate routing are kept.
+Both generated hosts use the production `-O2 -fPIC` flags.
+
+### Measurement
+
+Apple M4 Max, Apple clang 21.0.0, Python 3.14.6, JAX 0.11.2, asdex 0.5.2,
+iree-base-compiler 3.12.0 and NumPy 2.5.4. One interleaved run uses five fresh processes per
+case and variant, with a seeded shuffle of case and pair order. Each process checks every sparse
+value and every omitted entry in the measured matrix triangle against the workload's independent
+dense reference before timing. The tolerance is the repository harness's `1e-9 + 1e-9 * abs(want)`.
+Inputs and outputs are 64-byte aligned. A calibrated native C loop runs for at least 0.2 seconds
+of process CPU time; loading, context creation and correctness checks are excluded. Each latency
+below is the best of five. All 210 measured processes passed their dense checks.
+
+Eligible/all counts executed dispatch calls per evaluation, excluding initialization and host
+fills/copies. Dispatch time is the eligible share of an instrumented baseline's dispatch time,
+including Accelerate dispatches in the denominator. These attribution measurements include timer
+cost and are separate from the uninstrumented latency run. C calls also require supported
+operations and the scalar/code budgets. C/IREE is candidate latency divided by baseline latency.
+
+Local fit counts unbatched differentiated JAX programs with nonempty derivatives whose tensors
+fit the 256-element limit, captured at `_sparse_scalar.differentiate`, before export. This is a
+size check, not a claim that the entire local program passes the C operation/code budgets or
+survives as one HAL dispatch. Every case has at least one fitting local program.
+
+| Case | Eligible/all | Dispatch time | C calls | Local fit | IREE µs | C µs | C/IREE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| race_cars 5 | 123/123 | 100.0% | 123 | 13/13 | 1.352 | 0.718 | 0.531 |
+| race_cars 40 | 118/123 | 92.8% | 108 | 13/13 | 5.030 | 5.587 | 1.111 |
+| race_cars 500 | 14/123 | 0.2% | 14 | 13/13 | 71.043 | 70.812 | 0.997 |
+| race_cars_jac 5 | 61/62 | 93.1% | 61 | 7/7 | 0.731 | 0.444 | 0.607 |
+| race_cars_jac 40 | 60/62 | 87.2% | 55 | 7/7 | 3.309 | 3.106 | 0.939 |
+| race_cars_jac 500 | 1/62 | <0.1% | 1 | 7/7 | 42.430 | 42.400 | 0.999 |
+| chain 3 | 39/189 | 3.6% | 39 | 4/4 | 15.693 | 15.756 | 1.004 |
+| chain 9 | 372/3872 | 1.7% | 370 | 3/12 | 784.477 | 782.711 | 0.998 |
+| chain 17 | 316/3896 | 0.4% | 316 | 3/12 | 1870.172 | 1863.867 | 0.997 |
+| chain_jac 3 | 108/151 | 40.9% | 108 | 11/11 | 5.694 | 5.702 | 1.001 |
+| chain_jac 9 | 1173/1427 | 48.2% | 1159 | 32/32 | 90.274 | 102.230 | 1.132 |
+| chain_jac 17 | 872/1427 | 10.4% | 872 | 32/32 | 204.764 | 204.299 | 0.998 |
+| npmpc 12 | 72/110 | 14.3% | 46 | 6/7 | 12.356 | 11.625 | 0.941 |
+| npmpc 200 | 29/110 | 0.2% | 16 | 6/7 | 151.121 | 150.999 | 0.999 |
+| npmpc_jac 12 | 26/43 | 9.1% | 26 | 7/8 | 7.263 | 6.980 | 0.961 |
+| npmpc_jac 200 | 0/43 | 0.0% | 0 | 7/8 | 79.588 | 79.395 | 0.998 |
+| npmpc_decoder 16 | 77/107 | 46.9% | 48 | 6/7 | 5.905 | 5.490 | 0.930 |
+| unbumpercars 2 | 148/164 | 8.6% | 148 | 10/10 | 25.248 | 24.061 | 0.953 |
+| unbumpercars 8 | 208/235 | 12.2% | 203 | 10/10 | 46.174 | 45.893 | 0.994 |
+| unbumpercars_jac 2 | 85/94 | 7.9% | 85 | 4/4 | 16.748 | 16.268 | 0.971 |
+| unbumpercars_jac 8 | 101/114 | 12.2% | 101 | 4/4 | 30.740 | 29.902 | 0.973 |
+
+### Why the gate fails
+
+The tensor-size selector admits batched fused kernels whose C expansion is slower than IREE.
+For race_cars N=40 it replaces 108 of 123 dispatch calls, representing 69.3% of instrumented
+baseline dispatch time, yet whole-kernel latency rises by 11.1%. For chain_jac M=9 it replaces
+1,159 of 1,427 calls, representing 45.6% of dispatch time, yet latency rises by 13.2%.
+Instrumented candidate profiles point to 40x4, 120-element and 160-element elementwise dispatches.
+Thus eligibility and the removal of dispatch-call overhead do not establish a performance win.
+Full scalar expansion can cost more than IREE's fused/vectorized loop code.
+
+Coverage also disappears where the important work grows. Eligible dispatches account for only
+0.2% of race_cars N=500 and npmpc N=200 dispatch time, and none of npmpc_jac N=200. The chain
+Hessians have only 3.6%, 1.7% and 0.4% eligible dispatch time at M=3/9/17. Those cases have little
+time available to save with this selector.
+
+Whole unbatched local programs can fit, particularly the race-car stages: their largest tensor
+has 16 elements. The largest chain Hessian local tensors reach 900/2,601 elements at M=9/17;
+three smaller local programs still fit in each case. The largest npmpc local program includes a
+1,396-element tensor, and the width-16 decoder reaches 452. `vmap` then folds instance counts
+into tensors, and IREE splits the local programs into dispatches. Replacing those dispatches
+does not recover a stage loop around a complete scalar local function.
+
+A future candidate needs a general cost rule that avoids slower scalar expansion of batched
+fused kernels, or a preserved local-function boundary with the instance loop outside it. Simply
+raising the tensor limit does not address the measured regressions. The tested 256-element
+selector does not justify a CPU default. Metal was untouched. Step 2, its semantic tests and its
+acceptance rerun were not started for the 256-element selector.
+
+### K2 artifacts
+
+All scratch is under `/tmp/aotax-k2/`. The raw official run is `timings.jsonl`, also collected in
+`timings.json`; `timings.log` records its execution order. `summary.json` contains all repetitions,
+exact ratios, eligible/replaced time shares and local sizes. `table.md` is a shorter summary and
+`metadata.json` records versions, flags and limits.
+
+- `<case>/base/iree/` contains unchanged StableHLO, executable configurations, HAL, host and dispatch sources.
+- `<case>/scalar/` contains the measured C host, archive, correctness-gated timing binary and `coverage.json`.
+- `<case>/profile/` contains baseline dispatch attribution; `profile-scalar/` exists for the two regressing cases.
+- `<case>/locals.json` and `sparse-report.txt` describe the unbatched local programs and structured extraction.
+- `measure.py`, `scalar_codegen.py`, `build_scalar.py`, `time_all.py` and `summary.py` reproduce the study.
+  `reproduce.sh` gives their invocation order. Earlier diagnostic loop variants and failed-build logs are
+  separate from the official run; no latency claim above uses them.
+
+
+### Prespecified 64-element gate
+
+The follow-up changes only the all-tensor and output limits from 256 to 64. It uses the same
+emitter, scalar/code budgets, compiler flags, cases, input/reference bytes, baseline binaries,
+timing drivers and seeded interleaved protocol. Retained C functions are byte-for-byte identical
+to the 256-element experiment. No other limit or cost rule was tried. Dispatch attribution was
+refreshed separately. All 210 timed processes passed the full dense checks before timing.
+Local fit now uses 64 elements; its meaning and the other columns are the same as above.
+
+| Case | Eligible/all | Dispatch time | C calls | Local fit | IREE µs | C µs | C/IREE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| race_cars 5 | 119/123 | 96.4% | 119 | 13/13 | 1.370 | 0.733 | 0.535 |
+| race_cars 40 | 39/123 | 21.9% | 39 | 13/13 | 5.061 | 4.820 | 0.952 |
+| race_cars 500 | 14/123 | 0.2% | 14 | 13/13 | 70.402 | 70.164 | 0.997 |
+| race_cars_jac 5 | 60/62 | 92.0% | 60 | 7/7 | 0.738 | 0.448 | 0.608 |
+| race_cars_jac 40 | 13/62 | 20.1% | 13 | 7/7 | 3.316 | 3.237 | 0.976 |
+| race_cars_jac 500 | 1/62 | <0.1% | 1 | 7/7 | 42.801 | 42.642 | 0.996 |
+| chain 3 | 36/189 | 3.4% | 36 | 2/4 | 15.790 | 15.611 | 0.989 |
+| chain 9 | 289/3872 | 0.9% | 289 | 2/12 | 781.277 | 780.037 | 0.998 |
+| chain 17 | 311/3896 | 0.4% | 311 | 2/12 | 1873.273 | 1868.320 | 0.997 |
+| chain_jac 3 | 107/151 | 40.6% | 107 | 11/11 | 5.622 | 5.709 | 1.016 |
+| chain_jac 9 | 871/1427 | 23.8% | 871 | 32/32 | 90.534 | 89.898 | 0.993 |
+| chain_jac 17 | 868/1427 | 10.1% | 868 | 32/32 | 205.397 | 204.996 | 0.998 |
+| npmpc 12 | 43/110 | 4.6% | 29 | 6/7 | 12.417 | 12.315 | 0.992 |
+| npmpc 200 | 28/110 | 0.2% | 15 | 6/7 | 150.801 | 150.804 | 1.000 |
+| npmpc_jac 12 | 11/43 | 1.9% | 11 | 7/8 | 7.275 | 7.290 | 1.002 |
+| npmpc_jac 200 | 0/43 | 0.0% | 0 | 7/8 | 79.561 | 79.625 | 1.001 |
+| npmpc_decoder 16 | 40/107 | 7.1% | 28 | 6/7 | 5.974 | 5.776 | 0.967 |
+| unbumpercars 2 | 144/164 | 7.5% | 144 | 10/10 | 25.241 | 24.029 | 0.952 |
+| unbumpercars 8 | 88/235 | 2.7% | 88 | 9/10 | 46.113 | 45.760 | 0.992 |
+| unbumpercars_jac 2 | 81/94 | 6.7% | 81 | 4/4 | 16.712 | 16.210 | 0.970 |
+| unbumpercars_jac 8 | 77/114 | 4.6% | 77 | 4/4 | 30.654 | 30.181 | 0.985 |
+
+The gate passes: race_cars N=5 is 46.5% faster and its Jacobian is 39.2% faster; the largest
+increase is 1.55% on chain_jac M=3, below the 2% limit. The raw run is
+`/tmp/aotax-k2/limit64/timings.jsonl`; `summary.json` retains all repetitions and exact ratios.
+`metadata.json` records binary/input hashes and verifies unchanged code for retained functions.
+
+### Production emitter and acceptance
+
+Not merged. The emitter passes the gate, but its gain is confined to the smallest race-car
+problems, and aotax stays an experiment in what IREE's own code generation can do. The code is
+on branch `ted/measure-tiny-c-dispatches` (commit bda1571); this section describes that branch.
+
+The branch's CPU default uses `src/aotax/tiny.py`, a 312-line float64 C emitter through the existing
+`_Host.dispatch` replacement route. Integration adds eight lines and removes four in `host.py`,
+and adds two lines in `__init__.py`. The new semantic tests have 185 lines; an existing BLAS test
+wrapper now forwards the added host keyword argument.
+
+Every tensor must have at most 64 elements. Scalar/code budgets remain 4,096 named values,
+8,192 lines and 262,144 source bytes per dispatch. Indexing and slices are static; independent
+sum reductions may contain at most 16 elements. Unsupported operations retain IREE's original
+dispatch. The production subset is narrower than the spike: it rejects runtime integer tensor
+loads, non-projected indexing maps, coupled reductions and interleaved stores/loads. This accounts
+for fewer C replacements and smaller gains than the gate prototype, without a workload-based rule.
+
+The emitter shares scalar expressions, reads all inputs before storing results, and only accepts
+dispatches whose stores form a suffix. It reuses HAL's allocation, alias and input-staging analysis.
+Floating constants retain signed zero; arithmetic is emitted without identity folding. Elementary
+functions call libm by default. In approximate mode, dispatches containing math operations stay
+with IREE; supported algebraic dispatches can still use C. The host's floating-point mode applies
+to both paths. Metal is unchanged.
+
+The acceptance run compiles the exact auto kernels through the production `aotax.compile` default.
+The 21 accurate cases' IREE executable sources match the original baseline sources exactly.
+Every compiled C helper was checked against the final emitter. One new interleaved run includes
+all 21 accurate cases and race_cars N=5 in approximate mode, five fresh processes per pair.
+The approximate row has its own IREE baseline and dispatch profile. All 220 timed processes
+passed their dense checks before timing. Compare ratios within this run, not absolute latencies
+with the earlier gate run.
+
+| Case | Eligible/all | Dispatch time | C calls | Local fit | IREE µs | C µs | C/IREE |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| race_cars 5 | 119/123 | 96.4% | 78 | 13/13 | 1.360 | 1.084 | 0.797 |
+| race_cars 40 | 39/123 | 21.9% | 39 | 13/13 | 5.090 | 4.835 | 0.950 |
+| race_cars 500 | 14/123 | 0.2% | 14 | 13/13 | 70.925 | 70.702 | 0.997 |
+| race_cars_jac 5 | 60/62 | 92.0% | 39 | 7/7 | 0.738 | 0.568 | 0.770 |
+| race_cars_jac 40 | 13/62 | 20.1% | 13 | 7/7 | 3.332 | 3.247 | 0.974 |
+| race_cars_jac 500 | 1/62 | <0.1% | 1 | 7/7 | 42.835 | 42.805 | 0.999 |
+| chain 3 | 36/189 | 3.4% | 34 | 2/4 | 16.040 | 15.871 | 0.989 |
+| chain 9 | 289/3872 | 0.9% | 287 | 2/12 | 790.625 | 786.945 | 0.995 |
+| chain 17 | 311/3896 | 0.4% | 311 | 2/12 | 1871.047 | 1887.859 | 1.009 |
+| chain_jac 3 | 107/151 | 40.6% | 105 | 11/11 | 5.612 | 5.646 | 1.006 |
+| chain_jac 9 | 871/1427 | 23.8% | 869 | 32/32 | 90.509 | 89.966 | 0.994 |
+| chain_jac 17 | 868/1427 | 10.1% | 868 | 32/32 | 204.656 | 204.037 | 0.997 |
+| npmpc 12 | 43/110 | 4.6% | 24 | 6/7 | 12.406 | 12.353 | 0.996 |
+| npmpc 200 | 28/110 | 0.2% | 10 | 6/7 | 150.857 | 151.085 | 1.002 |
+| npmpc_jac 12 | 11/43 | 1.9% | 11 | 7/8 | 7.335 | 7.281 | 0.993 |
+| npmpc_jac 200 | 0/43 | 0.0% | 0 | 7/8 | 79.760 | 80.041 | 1.004 |
+| npmpc_decoder 16 | 40/107 | 7.1% | 23 | 6/7 | 5.916 | 5.808 | 0.982 |
+| unbumpercars 2 | 144/164 | 7.5% | 95 | 10/10 | 25.267 | 24.589 | 0.973 |
+| unbumpercars 8 | 88/235 | 2.7% | 62 | 9/10 | 46.533 | 46.014 | 0.989 |
+| unbumpercars_jac 2 | 81/94 | 6.7% | 55 | 4/4 | 17.186 | 16.497 | 0.960 |
+| unbumpercars_jac 8 | 77/114 | 4.6% | 55 | 4/4 | 30.634 | 30.350 | 0.991 |
+| race_cars 5, approximate | 119/123 | 96.3% | 68 | 13/13 | 1.374 | 1.091 | 0.794 |
+
+Acceptance also passes the gate. Production latency falls by 20.3% for race_cars N=5 and 23.0%
+for its Jacobian. The largest default-case increase is 0.90%; approximate race_cars N=5 improves
+by 20.6%. Raw acceptance timings are `/tmp/aotax-k2/limit64/acceptance/timings.jsonl`;
+`summary.json` contains every repetition. `metadata.json` records production hashes and source
+comparisons, and `build.py` reproduces the production builds.
+
+Validation: `uv run pytest` passes with 375 passed and one existing expected failure;
+`uv run ruff check`, `uv run ruff format --check` and `uv run --group bench ty check` pass.
+The 20 focused tests compare against IREE and cover zero/NaN/infinity, signed zero, libm,
+approximate-mode fallback, reductions, offsets, rank reduction, overlapping and unaligned arrays,
+multiple outputs, type/size/operation/reduction-budget fallback, scalar budgets, coupled reductions
+and interleaved stores/loads. Logs are under `/tmp/aotax-k2/limit64/`.
+
+Remaining limits are the pinned IREE source format and the float64/static-indexing subset.
+Unsupported dispatches retain IREE behavior, including its existing overlapping dynamic-update bug.

@@ -111,6 +111,8 @@ uv run --group bench benchmarks/bench.py --reps 5
   Even the narrower broadcast rule slows unbumpercars at 8 cars by 7% if applied across products.
 - Chain Hessian: pruning gradient components before the second differentiation makes IREE
   compilation too heavy, and reverse-over-reverse is slower; grouping identical input neighborhoods works.
+- Plain C for tiny dispatches, outside IREE's code generation: with tensors of at most 64 elements it
+  speeds up only race_cars N=5 (20%); at 256 it slows 120-160-element kernels. Not merged (PLAN.md, K2).
 - Sparse differentiation dominates the remaining gap: Scaly and asdex agree on the nonzeros,
   but asdex's color batches do 4.5-11.5 times the estimated scalar arithmetic of Scaly's program
   on the four profiled cases. Host work outside dispatches and memory operations is only
