@@ -273,6 +273,23 @@ def test_multiple_shared_maps_fall_back_with_reason():
 
 
 @pytest.mark.parametrize("hessian", [False, True])
+def test_passive_shared_map_falls_back(hessian):
+  pytest.importorskip("asdex")
+  index = np.array([0, 2, 2, 1])
+
+  def f(x, p):
+    shared = jnp.stack([jnp.sin(x[:3]), p], axis=1)
+    y = jnp.cos(shared[index, 1]) * x[index] ** 2
+    return y.sum() if hessian else y
+
+  args = (np.linspace(-0.3, 0.4, 4), np.linspace(0.1, 0.5, 3))
+  result = check(f, args, hessian=hessian, method="auto")
+  assert "fallback: shared map: no used output depends on the selected input" in result.report
+  with pytest.raises(ValueError, match="no used output depends"):
+    check(f, args, hessian=hessian)
+
+
+@pytest.mark.parametrize("hessian", [False, True])
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 def test_shared_map_dtype_conversion_falls_back(hessian, dtype):
   pytest.importorskip("asdex")

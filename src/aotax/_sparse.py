@@ -795,6 +795,8 @@ def compose(graph, specs, source, hessian):
   graph.output = graph.build(jax.make_jaxpr(lambda x: x.reshape(-1)[needed])(spec), [source])[0]
   maps, _ = extract(graph, specs, False, linear=False)
   graph.output = output
+  if not maps:
+    raise Unsupported("shared map: no used output depends on the selected input")
   active = np.unique(np.concatenate([needed[rows.reshape(-1)] for _, rows, _, _, _ in maps]))
   independent = np.setdiff1d(needed, active)
   independent_fn, independent_params = lambda x: x, []
