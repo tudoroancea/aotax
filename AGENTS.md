@@ -70,6 +70,8 @@ uv run --group bench benchmarks/bench.py --reps 5
 - Sparse extraction relies on JAX internals: `jax.core.eval_jaxpr` and `Tracer`,
   `jax.extend.core.Literal`, jaxpr and primitive layouts, `convert_element_type` weak-type flags and
   custom-JVP `jvp_jaxpr_fun.call_wrapped`. Rerun tests/test_sparse*.py on JAX upgrades.
+- Shared-map composition keeps both orientations of downstream second derivatives before
+  lower-triangle recovery, because custom derivative rules can make them nonsymmetric.
 
 ## Measuring
 

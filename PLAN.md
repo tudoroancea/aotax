@@ -151,7 +151,14 @@ new modules until their design is settled.
   bodies missed by the asdex out-of-bounds guard and an over-broad `cond` rejection, both fixed.
   asdex 0.5.2 drops clamped out-of-bounds gather indices; aotax rejects them.
 - [ ] J3. Bounded scalar local derivatives and nested neighborhoods; accept on the chain Hessian.
-- [ ] J4. Shared local maps that feed several factors (unbumpercars' per-car network).
+- [x] J4. Shared local maps: a computed array read by several factors through gathers or
+  overlapping slices is kept as one map. Outputs no factor uses are dropped, its local Jacobian and
+  second derivatives are computed once per instance, and derivatives compose through it. µs asdex /
+  auto / Scaly: unbumpercars Hessian 8 cars 234 / 53 / 563, Jacobian 68 / 30 / 167; other workloads
+  unchanged. Several computed gather sources and dtype changes fall back. The Sol review stopped at
+  capacity and the Opus one on API errors; Opus 5.5 (this session) finished it with adversarial
+  probes and reruns of the J2 review probes. Fixed: a crash when no used output depends on the
+  input, which now falls back.
 - [ ] J5. `scan`, where carry analysis proves local structure; nonlinear rollouts stay dense.
 - [x] K0. Selective scalarization spike (notes/scalarization.md). IREE cannot reproduce Scaly's
   scalarization: Scaly's gain comes from turning a whole local stage function into scalar code with
