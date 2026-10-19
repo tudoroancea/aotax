@@ -23,9 +23,14 @@ def obj(value):
 def scalarize(fn, *specs, hessian=False):
   closed = jax.make_jaxpr(fn)(*specs)
   graph = Graph(closed, -1)
-  work = sum(s.size for s in specs) + sum(n.size + sum(a.size for a in n.ins) for n in graph.nodes)
-  if hessian and specs[0].size * work > 262_144:
-    raise Unsupported("local Hessian: scalar differentiation exceeds construction budget 262144")
+  if hessian:
+    # Custom JVP rules are replayed per element, so their bodies count toward the budget.
+    def rule(e):
+      return len(e.params["jvp_jaxpr_fun"].call_wrapped(*[False] * len(e.invars))[0].eqns) if e and e.primitive.name == "custom_jvp_call" else 0
+
+    work = sum(s.size for s in specs) + sum((1 + rule(n.eq)) * (n.size + sum(a.size for a in n.ins)) for n in graph.nodes)
+    if specs[0].size * work > 262_144:
+      raise Unsupported("local Hessian: scalar differentiation exceeds construction budget 262144")
 
   def scalar_fn(xs, *params):
     args = []

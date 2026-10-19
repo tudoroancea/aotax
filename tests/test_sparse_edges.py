@@ -346,6 +346,29 @@ def test_wide_scalar_preserves_custom_second_derivatives():
   check(f, (x, np.array(0.2)), hessian=True)
 
 
+def test_custom_rule_counts_toward_scalar_budget():
+  @jax.custom_jvp
+  def custom(a):
+    return jnp.sin(a)
+
+  @custom.defjvp
+  def rule(primals, tangents):
+    (a,), (da,) = primals, tangents
+    h = a
+    for _ in range(4096):
+      h = jnp.sin(h + 0.01)
+    return custom(a), h * da
+
+  def f(x):
+    h = x.reshape(2, 12)
+    for _ in range(12):
+      h = jnp.sin(h + 0.3 * jnp.roll(h, 1, axis=1))
+    return custom(h).sum()
+
+  with pytest.raises(ValueError, match="scalar differentiation exceeds construction budget"):
+    sparse_hessian(f, jax.ShapeDtypeStruct((24,), np.float64), method="structured")
+
+
 def test_local_program_count_budget():
   f = lambda x: sum(jnp.sin(x[i] + i / 10) ** 2 for i in range(257))
   with pytest.raises(ValueError, match="more than 256 distinct index programs"):
