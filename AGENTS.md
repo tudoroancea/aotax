@@ -18,7 +18,7 @@
 - `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
 - `benchmarks/`: Scaly's sparse derivative workloads, timed against Scaly's generated C, and complete
   JAX programs, timed against XLA; workloads live in `benchmarks/workloads/` (`benchmarks/README.md`).
-  `benchmarks/metal.py` compares the Metal and CPU paths; `benchmarks/scaly_devrush.py` Scaly's solvers.
+  `benchmarks/metal.py` compares the Metal and CPU paths.
 
 ## Checks
 

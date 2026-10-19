@@ -333,8 +333,6 @@ call overhead. These historical measurements also used approximations. aotax tim
 | batched Newton | batch 1, 4, 16, 64 | 1.23×, 0.96×, 1.05×, 1.05× |
 
 Newton loses at larger n because hundreds of small dispatches surround each factorization.
-`benchmarks/scaly_devrush.py` compares Newton and the quadratic program with the solvers Scaly
-generates on its development branch.
 
 With `approximate_math=True` on the GPU, `device="metal"` pays off only for batches: from about
 32 to 48 npmpc Hessians at horizon 12, or 10 to 12 at horizon 50, it beats the CPU, by 4.5× and
