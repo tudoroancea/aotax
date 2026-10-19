@@ -124,8 +124,8 @@ Fast and cannot repair polynomials already emitted by IREE. See Apple's
 With `math_before_broadcast=True`, aotax puts compiler barriers after CPU `float64` `sin`, `cos`
 and `tanh` results that feed broadcasts. IREE then computes these libm results before broadcasting
 them, instead of repeating the calls for the added dimensions. Results are unchanged. It makes the
-race-car Jacobians 12 to 13% faster, but the barriers also block fusion, which can be slower:
-unbumpercars at 8 cars by 7%.
+asdex race-car Jacobians 14 to 19% faster and leaves the structured ones unchanged. The barriers
+also block fusion, which slowed unbumpercars at 8 cars by 7% in an earlier measurement.
 
 Four compiler settings matter:
 
@@ -293,27 +293,30 @@ The derivative workloads come from [Scaly](https://github.com/PREDICT-EPFL/scaly
 suite: sparse Lagrangian Hessians and constraint Jacobians for chain and race-car control,
 a neural-process controller with horizon and decoder-width sweeps, and a learned-car safety filter.
 Scaly compiles them with its own symbolic compiler; aotax compiles the
-same functions written in JAX through `aotax.sparse`. The `aotax` column uses
-[asdex](https://adrianhill.de/asdex/) and `aotax_structured` uses automatic local extraction with
-asdex fallback. Each library has a `sparse-report.txt` recording its method and construction time.
-Every entry is checked against a dense JAX derivative before timing. aotax CPU time divided by
-Scaly's on an Apple M4 Max, best of three processes. These historical measurements use the asdex
-baseline and the math approximations now enabled by `approximate_math=True`; new runs use the
-accurate default and also print the structured column:
+same functions written in JAX through `aotax.sparse`, in two ways: classical
+[asdex](https://adrianhill.de/asdex/) coloring (`method="asdex"`, the `aotax` column of
+`bench.py`) and structured extraction (`method="auto"`, `aotax_structured`), which takes the
+structured path on every workload here. Each library has a `sparse-report.txt` recording its
+method and construction time. Every entry is checked against a dense JAX derivative before timing.
+aotax CPU time divided by Scaly's on an Apple M4 Max, best of five fresh processes, with the default
+accurate math:
 
-| Problem | Sizes | Hessian | Jacobian |
-|---|---|---|---|
-| npmpc, neural-network dynamics | horizon 12, 50, 200 | 1.06×, 0.94×, 0.80× | 0.93×, 0.80×, 0.77× |
-| npmpc_decoder, network width | width 16, 64, 256 | 1.69×, 0.47×, 0.19× | 1.05×, 0.56×, 0.20× |
-| unbumpercars, network plant | 2, 4, 8 cars | 0.32×, 0.31×, 0.42× | 0.62×, 0.36×, 0.41× |
-| chain of masses | 3, 9, 17 masses | 3.72×, 3.35×, 2.24× | 16.1×, 5.73×, 4.12× |
-| race cars | horizon 5, 40, 500 | 5.28×, 4.55×, 5.22× | 5.09×, 4.76×, 4.95× |
+| Problem | Sizes | Hessian, asdex | Hessian, structured | Jacobian, asdex | Jacobian, structured |
+|---|---|---|---|---|---|
+| npmpc, neural-network dynamics | horizon 12, 50, 200 | 0.98×, 0.88×, 0.89× | 0.74×, 0.64×, 0.61× | 0.90×, 0.81×, 0.75× | 0.71×, 0.63×, 0.50× |
+| npmpc_decoder, network width | width 16, 64, 256 | 1.59×, 0.41×, 0.16× | 1.10×, 0.33×, 0.12× | 1.06×, 0.55×, 0.17× | 0.73×, 0.45×, 0.14× |
+| unbumpercars, network plant | 2, 4, 8 cars | 0.23×, 0.23×, 0.42× | 0.17×, 0.11×, 0.08× | 0.44×, 0.34×, 0.39× | 0.40×, 0.23×, 0.17× |
+| chain of masses | 3, 9, 17 masses | 3.46×, 3.02×, 2.01× | 0.70×, 2.36×, 1.67× | 16.6×, 5.42×, 4.26× | 1.43×, 1.47×, 0.51× |
+| race cars | horizon 5, 40, 500 | 4.43×, 3.28×, 3.95× | 1.80×, 1.23×, 1.44× | 5.63×, 5.01×, 4.99× | 1.41×, 1.07×, 1.05× |
 
 aotax is faster where neural networks dominate: their matrix products run on Apple's matrix
-coprocessor through Accelerate, and the rest vectorizes. It is slower on small dynamics without
-matrix products. There most of the gap is the derivative algorithm rather than the compiler:
+coprocessor through Accelerate, and the rest vectorizes. With asdex it is slower on small dynamics
+without matrix products. There most of the gap is the derivative algorithm rather than the compiler:
 asdex's colored products do 4.5 to 11.5 times the arithmetic of Scaly's symbolic derivatives, and
-XLA running the same asdex functions is also 5 to 9 times slower than Scaly.
+XLA running the same asdex functions is also 5 to 9 times slower than Scaly. Structured extraction
+removes most of that gap: race-car Jacobians come within 7% of Scaly at horizons 40 and 500, and the
+chain Jacobian at 17 masses takes half of Scaly's time. The chain Hessian at 9 and 17 masses
+remains 1.7 to 2.4 times slower.
 
 The accurate default costs little on these workloads. In an interleaved comparison, best of five
 fresh processes per mode, opt-in makes npmpc 2 to 6% faster and leaves race cars unchanged. On
@@ -324,15 +327,15 @@ The complete programs run whole algorithms written in JAX with loops: a fourth-o
 rollout, a Newton solve with `while_loop` and LU factorizations, a Gauss-Newton fit with Cholesky
 solves, a 15-step interior-point method for a quadratic program, and a batched Newton solve. aotax
 is compared with XLA running the same function inside one jitted loop, which excludes Python's
-call overhead. These historical measurements also used approximations. aotax time divided by XLA's:
+call overhead. aotax time divided by XLA's, from the same run:
 
 | Program | Sizes | aotax / XLA |
 |---|---|---|
-| rollout | 3×12, 3×50, 3×200, 5×50, 10×50 | 0.43×, 0.52×, 0.84×, 0.67×, 0.94× |
-| Newton | n = 4, 8, 16, 32, 64 | 0.78×, 1.07×, 1.22×, 1.43×, 1.19× |
-| Gauss-Newton | 16×3×8, 64×3×8, 64×5×12 | 0.45×, 0.44×, 0.35× |
-| quadratic program | 3×4×15, 3×12×15, 5×12×15 | 0.66×, 0.90×, 0.90× |
-| batched Newton | batch 1, 4, 16, 64 | 1.23×, 0.96×, 1.05×, 1.05× |
+| rollout | 3×12, 3×50, 3×200, 5×50, 10×50 | 0.42×, 0.54×, 0.85×, 0.67×, 0.95× |
+| Newton | n = 4, 8, 16, 32, 64 | 0.83×, 1.14×, 1.25×, 1.43×, 1.25× |
+| Gauss-Newton | 16×3×8, 64×3×8, 64×5×12 | 0.48×, 0.50×, 0.40× |
+| quadratic program | 3×4×15, 3×12×15, 5×12×15 | 0.66×, 0.90×, 0.91× |
+| batched Newton | batch 1, 4, 16, 64 | 1.24×, 0.96×, 1.08×, 1.07× |
 
 Newton loses at larger n because hundreds of small dispatches surround each factorization.
 

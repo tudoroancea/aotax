@@ -189,6 +189,10 @@ new modules until their design is settled.
   elements. At most 64 elements, the production emitter (312 lines) makes race_cars N=5 20% and its
   Jacobian 23% faster, with every other case within ±1%. Not merged: aotax stays an experiment in
   IREE's own code generation. The code is on branch `ted/measure-tiny-c-dispatches`.
+- [x] Review of control-specific code. `benchmarks/scaly_devrush.py` is removed. Computing libm
+  results before broadcasts is opt-in (`math_before_broadcast`), without the condition on dot
+  operations that stood in for the race-car workloads. `aotax.sparse` stays; the README shows
+  asdex and structured results side by side, from a full sweep with the accurate default.
 
 I and K1 are independent. One agent does J1 then J2; J3 and J4 follow J2 and can run in parallel
 with separate file ownership; K2 follows J2.

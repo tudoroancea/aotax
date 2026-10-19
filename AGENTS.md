@@ -107,8 +107,8 @@ uv run --group bench benchmarks/bench.py --reps 5
   stays within 3 units in the last place of libm on 1.1 million samples, including special values. It improves the
   race-car Jacobians by only 1-3% and barely changes the Hessians; not kept.
 - Barriers after every f64 `sin`, `cos` and `tanh` slow npmpc N=200 by 12%. Barriers only on libm
-  results that feed broadcasts are opt-in (`math_before_broadcast`): race-car Jacobians 12-13% faster,
-  unbumpercars at 8 cars 7% slower. A default limited to programs without dot operations was a
+  results that feed broadcasts are opt-in (`math_before_broadcast`): asdex race-car Jacobians 14-19%
+  faster, structured ones unchanged, unbumpercars at 8 cars 7% slower. A default limited to programs without dot operations was a
   workload proxy and was removed.
 - Chain Hessian: pruning gradient components before the second differentiation makes IREE
   compilation too heavy, and reverse-over-reverse is slower; grouping identical input neighborhoods works.
