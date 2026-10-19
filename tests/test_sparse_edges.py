@@ -346,24 +346,34 @@ def test_wide_scalar_preserves_custom_second_derivatives():
   check(f, (x, np.array(0.2)), hessian=True)
 
 
-def test_custom_rule_counts_toward_scalar_budget():
+@pytest.mark.parametrize("nested", [False, True])
+def test_custom_rule_counts_toward_scalar_budget(nested):
   @jax.custom_jvp
-  def custom(a):
+  def inner(a):
     return jnp.sin(a)
 
-  @custom.defjvp
-  def rule(primals, tangents):
+  @inner.defjvp
+  def inner_rule(primals, tangents):
     (a,), (da,) = primals, tangents
     h = a
     for _ in range(4096):
       h = jnp.sin(h + 0.01)
-    return custom(a), h * da
+    return inner(a), h * da
+
+  @jax.custom_jvp
+  def outer(a):
+    return jnp.sin(a)
+
+  @outer.defjvp
+  def outer_rule(primals, tangents):
+    (a,), (da,) = primals, tangents
+    return outer(a), inner(a) * da
 
   def f(x):
     h = x.reshape(2, 12)
     for _ in range(12):
       h = jnp.sin(h + 0.3 * jnp.roll(h, 1, axis=1))
-    return custom(h).sum()
+    return (outer if nested else inner)(h).sum()
 
   with pytest.raises(ValueError, match="scalar differentiation exceeds construction budget"):
     sparse_hessian(f, jax.ShapeDtypeStruct((24,), np.float64), method="structured")
