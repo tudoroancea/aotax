@@ -11,8 +11,8 @@
 - `src/aotax/cpu.py`: CPU compilation splits at executable configurations; this fills vector tile
   dimensions of extent 2, 4 or 8 in projected-permutation `linalg.generic`s, within 32 elements.
 - `src/aotax/blas.py`: on macOS, pure contraction dispatches become Accelerate `cblas_*gemm` calls.
-- `src/aotax/math.py`: preserves accurate elementary functions through JAX/IREE lowering, optionally
-  expands f64 `exp`, and separates broadcasted libm results in programs without dot operations.
+- `src/aotax/math.py`: preserves accurate elementary functions through JAX/IREE lowering, and
+  optionally expands f64 `exp` or computes libm results before their broadcasts.
 - `src/aotax/sparse.py`: sparse Hessians and Jacobians; `_sparse.py` extracts and assembles local
   primal programs, `_sparse_scalar.py` specializes small local derivatives, asdex is the fallback.
 - `src/aotax/custom_calls.py`: preserves tensor custom calls through HAL and generates Accelerate LAPACK adapters.
@@ -106,9 +106,10 @@ uv run --group bench benchmarks/bench.py --reps 5
 - A vectorized f64 `tanh`, with a [9/10] Padé approximation on [-1, 1] and `exp` outside it,
   stays within 3 units in the last place of libm on 1.1 million samples, including special values. It improves the
   race-car Jacobians by only 1-3% and barely changes the Hessians; not kept.
-- Barriers after every f64 `sin`, `cos` and `tanh` slow npmpc N=200 by 12%. Keep matrix-product
-  programs' fusion; separate only libm results that feed broadcasts in programs without dot operations.
-  Even the narrower broadcast rule slows unbumpercars at 8 cars by 7% if applied across products.
+- Barriers after every f64 `sin`, `cos` and `tanh` slow npmpc N=200 by 12%. Barriers only on libm
+  results that feed broadcasts are opt-in (`math_before_broadcast`): race-car Jacobians 12-13% faster,
+  unbumpercars at 8 cars 7% slower. A default limited to programs without dot operations was a
+  workload proxy and was removed.
 - Chain Hessian: pruning gradient components before the second differentiation makes IREE
   compilation too heavy, and reverse-over-reverse is slower; grouping identical input neighborhoods works.
 - Plain C for tiny dispatches, outside IREE's code generation: with tensors of at most 64 elements it

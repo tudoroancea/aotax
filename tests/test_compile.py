@@ -9,8 +9,8 @@ from aotax import _Loaded
 jax.config.update("jax_enable_x64", True)
 
 
-def check(fn, *args, tmp_path, rtol=1e-12):
-  loaded = aotax.compile(fn, *args, out=tmp_path).load()
+def check(fn, *args, tmp_path, rtol=1e-12, **options):
+  loaded = aotax.compile(fn, *args, out=tmp_path, **options).load()
   got, want = loaded(*args), jax.jit(fn)(*args)
   jax.tree.map(lambda g, w: np.testing.assert_allclose(g, w, rtol=rtol, atol=rtol), got, want)
   return loaded
@@ -25,23 +25,16 @@ def test_f64_transcendentals_and_matmul(tmp_path):
   check(mlp, rng.normal(size=(3, 5)), rng.normal(size=5), tmp_path=tmp_path)
 
 
-def test_shared_math_broadcast(tmp_path):
+@pytest.mark.parametrize("before", [False, True])
+def test_math_before_broadcast(tmp_path, before):
   def f(x, w):
     return jnp.sin(x)[:, None] * w + jnp.cos(x)[None, :] + jnp.tanh(x)[:, None]
 
   x = np.r_[np.linspace(-20, 20, 65), -1e12, 1e12, -0.0, 0.0]
   w = np.linspace(-1, 1, x.size**2).reshape(x.size, x.size)
-  loaded = check(f, x, w, tmp_path=tmp_path)
-  assert "stablehlo.optimization_barrier" in (tmp_path / "iree/stablehlo.mlir").read_text()
+  loaded = check(f, x, w, tmp_path=tmp_path, math_before_broadcast=before)
+  assert ("stablehlo.optimization_barrier" in (tmp_path / "iree/stablehlo.mlir").read_text()) == before
   np.testing.assert_allclose(loaded(x + 0.125, w), f(x + 0.125, w), rtol=1e-12, atol=1e-12)
-
-
-def test_math_broadcast_preserves_dot_fusion(tmp_path):
-  def f(x, w):
-    return jnp.sin(x)[:, None] + w @ w
-
-  check(f, np.linspace(-2, 2, 8), np.arange(64.0).reshape(8, 8) / 64, tmp_path=tmp_path)
-  assert "stablehlo.optimization_barrier" not in (tmp_path / "iree/stablehlo.mlir").read_text()
 
 
 def test_pytrees_scalars_and_mixed_dtypes(tmp_path):

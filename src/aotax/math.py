@@ -161,17 +161,14 @@ def _exp(x):
   return jax.lax.select(jax.lax.ne(x, x), x, result)
 
 
-def expand_math(text: str, approximate: bool = False) -> str:
+def expand_math(text: str, approximate: bool = False, before_broadcast: bool = False) -> str:
   with ir.Context() as ctx:
     ctx.allow_unregistered_dialects = True
     module = ir.Module.parse(text)
     ops = []
     shared = []
-    has_dot = False
 
     def collect(op):
-      nonlocal has_dot
-      has_dot |= op.name in {"stablehlo.dot", "stablehlo.dot_general"}
       if (
         op.name == "stablehlo.exponential"
         and approximate
@@ -180,7 +177,8 @@ def expand_math(text: str, approximate: bool = False) -> str:
       ):
         ops.append(op)
       elif (
-        op.name in {"stablehlo.sine", "stablehlo.cosine", "stablehlo.tanh"}
+        before_broadcast
+        and op.name in {"stablehlo.sine", "stablehlo.cosine", "stablehlo.tanh"}
         and str(ir.RankedTensorType(op.results[0].type).element_type) == "f64"
         and any(use.owner.name == "stablehlo.broadcast_in_dim" for use in op.results[0].uses)
       ):
@@ -191,17 +189,16 @@ def expand_math(text: str, approximate: bool = False) -> str:
             collect(child.operation)
 
     collect(module.operation)
-    if not has_dot:
-      for op in shared:
-        barrier = ir.Operation.create(
-          "stablehlo.optimization_barrier",
-          operands=[op.results[0]],
-          results=[op.results[0].type],
-          ip=ir.InsertionPoint.after(op),
-          loc=op.location,
-        )
-        op.results[0].replace_all_uses_with(barrier.results[0])
-        barrier.operands[0] = op.results[0]
+    for op in shared:
+      barrier = ir.Operation.create(
+        "stablehlo.optimization_barrier",
+        operands=[op.results[0]],
+        results=[op.results[0].type],
+        ip=ir.InsertionPoint.after(op),
+        loc=op.location,
+      )
+      op.results[0].replace_all_uses_with(barrier.results[0])
+      barrier.operands[0] = op.results[0]
     helpers = {}
     for op in ops:
       t = ir.RankedTensorType(op.results[0].type)

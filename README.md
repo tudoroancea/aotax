@@ -121,9 +121,11 @@ and opt-in selects `Fast`. These are separate options. Safe alone leaves native 
 Fast and cannot repair polynomials already emitted by IREE. See Apple's
 [compile-option semantics](https://developer.apple.com/documentation/metal/mtlcompileoptions/mathmode).
 
-In programs without StableHLO dot operations, aotax also puts compiler barriers after `float64` `sin`,
-`cos` and `tanh` results that feed broadcasts. IREE then computes these libm results before
-broadcasting them, instead of repeating the calls for the added dimensions.
+With `math_before_broadcast=True`, aotax puts compiler barriers after CPU `float64` `sin`, `cos`
+and `tanh` results that feed broadcasts. IREE then computes these libm results before broadcasting
+them, instead of repeating the calls for the added dimensions. Results are unchanged. It makes the
+race-car Jacobians 12 to 13% faster, but the barriers also block fusion, which can be slower:
+unbumpercars at 8 cars by 7%.
 
 Four compiler settings matter:
 

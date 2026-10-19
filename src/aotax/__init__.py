@@ -92,6 +92,7 @@ def compile(
   foreign: Mapping[str, str | Foreign] | None = None,
   device: str = "cpu",
   approximate_math: bool = False,
+  math_before_broadcast: bool = False,
 ) -> Library:
   """Compile `fn` at the shapes and dtypes of `args`, arrays or `jax.ShapeDtypeStruct`s, into `out`.
 
@@ -99,6 +100,8 @@ def compile(
   StableHLO, IREE's hardware abstraction layer (HAL) program, dispatch object and generated host.
   `approximate_math=True` permits IREE's math approximations and aotax's f64 exp polynomial.
   The default uses libm-quality elementary functions; Metal runs these on the host.
+  `math_before_broadcast=True` computes CPU f64 `sin`, `cos` and `tanh` before broadcasting their
+  results, instead of once per broadcast element; results are unchanged.
   """
   if device not in {"cpu", "metal"}:
     raise ValueError(f"aotax: unsupported device {device!r}; use 'cpu' or 'metal'")
@@ -144,7 +147,7 @@ def compile(
 
     text, custom_calls = exported.mlir_module(), {}
   else:
-    text, custom_calls = expand_math(exported.mlir_module(), approximate_math), {}
+    text, custom_calls = expand_math(exported.mlir_module(), approximate_math, math_before_broadcast), {}
   text, math_calls = accurate_math(text, device, approximate_math)
   custom_calls.update(math_calls)
   if device == "metal":
